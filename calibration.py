@@ -245,13 +245,28 @@ def capture(cols: int, rows: int, square_mm: float, want: int,
     RMS, so a view is kept only when the board has shifted appreciably
     since the last accepted one.
     """
-    cap = cv2.VideoCapture(device)
-    if not cap.isOpened():
-        print(f"cannot open camera {device}. On a Pi check: raspi-config, "
-              "the ribbon seating, and `libcamera-hello`.")
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    try:
+        from picamera2 import Picamera2
+
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(main={"size": (width, height), "format": "RGB888"})
+        picam2.configure(config)
+        picam2.start()
+        time.sleep(2)
+
+        use_picamera = True
+
+    except Exception:
+        cap = cv2.VideoCapture(device)
+
+        if not cap.isOpened():
+            print(f"Cannot open camera {device}")
+            return None
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        use_picamera = False
 
     obj = board_object_points(cols, rows, square_mm)
     img_points, obj_points, size = [], [], None
@@ -264,7 +279,11 @@ def capture(cols: int, rows: int, square_mm: float, want: int,
 
     try:
         while len(img_points) < want:
-            ok, frame = cap.read()
+            if use_picamera:
+                frame = picam2.capture_array()
+                ok = frame is not None
+            else:
+                ok, frame = cap.read()
             if not ok or frame is None:
                 time.sleep(0.05)
                 continue
@@ -290,7 +309,10 @@ def capture(cols: int, rows: int, square_mm: float, want: int,
     except KeyboardInterrupt:
         print("\n  stopped early")
     finally:
-        cap.release()
+        if use_picamera:
+            picam2.stop()
+        else:
+            cap.release()
 
     if len(img_points) < 4:
         print(f"\nonly {len(img_points)} views -- cannot calibrate")
