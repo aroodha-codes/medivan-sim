@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Output
+output/
+logs/
+*.log
+
+# VS Code
+.vscode/
+
+# Generated files
+*.npz
+*.npy
+
+# Calibration (optional)
+calibration/
