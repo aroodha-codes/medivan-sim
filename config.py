@@ -14,7 +14,7 @@ from typing import List, Tuple
 # ════════════════════════════════════════════════
 # DEPLOYMENT MODE
 # ════════════════════════════════════════════════
-HARDWARE_MODE: bool = False                 # Set to True when running on the physical Raspberry Pi
+HARDWARE_MODE: bool = True                 # Set to True when running on the physical Raspberry Pi
 
 # ════════════════════════════════════════════════
 # RASPBERRY PI GPIO CONFIGURATION (BCM Numbering)
