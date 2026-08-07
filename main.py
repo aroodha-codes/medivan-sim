@@ -38,6 +38,27 @@ from config import (
     ObstacleAction, VibrationLevel,
 )
 from modules.map_loader import MapLoader
+from modules.perception_source import CameraPerceptionSource
+
+
+class _FrameRelay:
+    """Presents the most recent camera frame with a VideoCapture interface.
+
+    CameraPerceptionSource calls `capture.read()` internally. On hardware
+    the camera is already owned by CameraHW, and the CSI sensor allows
+    only one consumer, so opening it twice fails. This relays the frame
+    the main loop just captured. `latest` is set once per iteration
+    before get_scan().
+    """
+
+    def __init__(self) -> None:
+        self.latest = None
+
+    def read(self):
+        return (self.latest is not None), self.latest
+
+    def release(self) -> None:
+        self.latest = None
 from modules.encoder_sim import EncoderSim
 from modules.imu_sim import IMUSim
 from modules.camera_sim import CameraSim
@@ -89,8 +110,15 @@ def main() -> None:
 
     # -- SLAM engine: robot always starts by mapping
     sim_mode = SimMode.MAPPING
-    slam: Optional[SLAMEngine] = SLAMEngine(ground_truth_free_fn=map_loader.is_free)
-    print("[main] Phase 1: SLAM MAPPING -- robot exploring environment...")
+    if HARDWARE_MODE:
+        # No ground truth exists on a real floor. Withholding it forces
+        # frontier exploration onto the grid the robot actually built,
+        # which is the entire point of mapping a real room.
+        slam: Optional[SLAMEngine] = SLAMEngine()
+        print("[main] Phase 1: SLAM MAPPING -- REAL sensors, empty map")
+    else:
+        slam = SLAMEngine(ground_truth_free_fn=map_loader.is_free)
+        print("[main] Phase 1: SLAM MAPPING -- robot exploring environment...")
 
     # ── Modules (Factory Pattern) ───────────────
     if HARDWARE_MODE:
@@ -105,6 +133,21 @@ def main() -> None:
         camera = CameraHW()
         motor = MotorDriverHW()
         bump = BumpSwitchSim()  # Fallback to sim for now if no physical bump switch
+
+        # -- Real range perception: camera -> floor -> IPM -> scan -----
+        from robot.aruco_docking import load_camera_calibration
+        _K, _D, _calibrated = load_camera_calibration()
+        if not _calibrated:
+            print("[main] WARNING: no camera calibration. Ranges carry a "
+                  "systematic scale error.")
+            print("[main]          Run: python3 calibration.py --capture")
+        perception = CameraPerceptionSource(
+            capture=_FrameRelay(),
+            camera_matrix=_K if _calibrated else None,
+            dist_coeffs=_D if _calibrated else None,
+        )
+        print(f"[main] Perception: live camera IPM ranges "
+              f"(calibrated={_calibrated})")
     else:
         print("[main] HARDWARE_MODE=False. Loading software simulators...")
         encoder = EncoderSim()
@@ -112,6 +155,7 @@ def main() -> None:
         camera = CameraSim()
         motor = MotorDriverSim()
         bump = BumpSwitchSim()
+        perception = None          # simulation path unchanged
 
     # Shared generic modules
     localizer = Localizer()
@@ -273,6 +317,12 @@ def main() -> None:
         if slam is not None and cam_frame is not None:
             try:
                 # Reuse enc_reading from step 4 — no second encoder.update()
+                real_scan = None
+                if perception is not None:
+                    perception._cap.latest = cam_frame
+                    real_scan = perception.get_scan(
+                        motor.x, motor.y, motor.theta)
+
                 slam.update(
                     cam_frame,
                     enc_dx=enc_reading.dx_px,
@@ -280,6 +330,11 @@ def main() -> None:
                     enc_dtheta=enc_reading.dtheta,
                     robot_x=motor.x, robot_y=motor.y, robot_theta=motor.theta,
                     ai_results=obstacles,
+                    # Passing scan= bypasses _extract_walls_from_camera,
+                    # the legacy Canny path the SLAM module itself
+                    # documents as unreliable. None in simulation, so
+                    # that path is unchanged.
+                    scan=real_scan,
                 )
                 if slam.mapping_complete:
                     print("[main] SLAM complete! Phase 2: NAVIGATION")
