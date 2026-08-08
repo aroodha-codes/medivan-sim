@@ -14,7 +14,26 @@ from typing import List, Tuple
 # ════════════════════════════════════════════════
 # DEPLOYMENT MODE
 # ════════════════════════════════════════════════
-HARDWARE_MODE: bool = True                 # Set to True when running on the physical Raspberry Pi
+HARDWARE_MODE: bool = False                 # Set to True when running on the physical Raspberry Pi
+
+# Windows real-camera perception mode.
+#
+# Only consulted when HARDWARE_MODE is False. When True, the simulator's
+# synthetic corridor is replaced as the PERCEPTION input by a USB / laptop
+# webcam read through cv2.VideoCapture, so floor segmentation and inverse
+# perspective mapping can be exercised against a real floor before the Pi
+# is involved. Robot motion, IMU and encoders stay simulated; no GPIO,
+# no I2C, no Picamera2 is touched on Windows.
+#
+# This flag has NO effect when HARDWARE_MODE is True.
+#
+# Default False: existing Windows simulation behaviour is unchanged.
+# Override per-run with:  python main.py --windows-real-camera
+WINDOWS_REAL_CAMERA: bool = False
+
+# Webcam index for WINDOWS_REAL_CAMERA. 0 is the built-in laptop camera on
+# most machines; an external USB camera is usually 1.
+WINDOWS_CAMERA_INDEX: int = 0
 
 # ════════════════════════════════════════════════
 # RASPBERRY PI GPIO CONFIGURATION (BCM Numbering)

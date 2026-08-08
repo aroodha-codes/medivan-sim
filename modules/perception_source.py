@@ -24,7 +24,7 @@ implementations behind it:
 
     SimulationPerceptionSource : 2D ray cast against the ground-truth map.
     CameraPerceptionSource     : calibration -> IPM -> floor segmentation ->
-                                 ground-plane ranges, on the real Pi Camera V2.
+                                 ground-plane ranges, on the real Pi Camera Module V1 (OV5647).
 
 Both return the same `RangeScan`, so SLAM, frontier exploration, A*, EKF and
 navigation are byte-identical in simulation and on hardware. Simulation no
@@ -34,7 +34,7 @@ which is where a range sensor's contract actually lives.
 
 HARDWARE
 ========
-Unchanged: Raspberry Pi 4, Pi Camera Module V2, MPU6050, L298N, existing
+Unchanged: Raspberry Pi 4, Pi Camera Module V1 (OV5647), MPU6050, L298N, existing
 chassis. No LiDAR, no ultrasonics, no depth camera.
 
 MATHEMATICAL BASIS
@@ -179,8 +179,14 @@ class SimulationPerceptionSource(PerceptionSource):
     so a scan taken at one pose differs from a scan at another -- the property
     the old simulated camera lacked entirely.
 
-    Sensor model matches the Pi Camera V2 so that behaviour tuned in
-    simulation transfers: horizontal FOV 62.2 deg (Sony IMX219), configurable
+    HARDWARE NOTE -- the physical camera is a Pi Camera Module V1
+    (OmniVision OV5647), NOT a V2/IMX219. The V1 has a NARROWER horizontal
+    field of view (~53.5 deg) than the 62.2 deg IMX219 figure that
+    PERCEPTION_HFOV_DEG still carries in config.py. Until that constant is
+    corrected and the camera is calibrated, every bearing in the emitted
+    scan is stretched by roughly the ratio of the two angles. Do not
+    substitute V2 intrinsics as a stand-in: calibrate the actual camera.
+    Sensor model, configurable
     ray count, finite max range, additive Gaussian noise with a
     range-proportional term, and random dropout.
 
@@ -251,7 +257,7 @@ class SimulationPerceptionSource(PerceptionSource):
 # ══════════════════════════════════════════════════════════════════
 
 class CameraPerceptionSource(PerceptionSource):
-    """Pi Camera V2 -> calibration -> IPM -> floor segmentation -> ranges.
+    """Pi Camera V1 (OV5647) -> calibration -> IPM -> floor segmentation -> ranges.
 
     Emits the identical `RangeScan` contract, so switching from simulation to
     hardware requires no change in SLAM, frontier exploration, A*, EKF or
@@ -259,7 +265,8 @@ class CameraPerceptionSource(PerceptionSource):
 
     PIPELINE
     --------
-    1. Capture       : one BGR frame from the Pi Camera V2.
+    1. Capture       : one BGR frame from the camera (Pi Camera V1 on the
+                       Pi; a USB / laptop webcam under WINDOWS_REAL_CAMERA).
     2. Undistort     : remove lens distortion using the calibrated intrinsic
                        matrix K and distortion coefficients.
     3. Floor segment : classify floor vs non-floor. The lowest image rows
@@ -290,7 +297,7 @@ class CameraPerceptionSource(PerceptionSource):
     ------
     Capture and the calibration/IPM/segmentation stages are scaffolded with
     the geometry implemented and verified, but this class has NOT been run
-    against a physical Pi Camera V2 -- no such hardware was available. Treat
+    against a physical camera -- no such hardware was available. Treat
     `CAMERA_FX/FY/CX/CY` as placeholders until you run the calibration
     procedure; ranges will be systematically wrong until you do.
     """

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import platform
 import sys
 import time
 from typing import Optional
@@ -36,6 +37,7 @@ from config import (
     DriveMode, DockState, CellType, SimMode, HARDWARE_MODE,
     VehicleState, IMUData, MotorCommand, BumpState,
     ObstacleAction, VibrationLevel,
+    WINDOWS_REAL_CAMERA, WINDOWS_CAMERA_INDEX, FRAME_W, FRAME_H,
 )
 from modules.map_loader import MapLoader
 from modules.perception_source import CameraPerceptionSource
@@ -59,6 +61,53 @@ class _FrameRelay:
 
     def release(self) -> None:
         self.latest = None
+
+
+def _windows_real_camera_enabled() -> bool:
+    """Is Windows real-camera perception on for this run?
+
+    Two ways to enable it, both inert on the Raspberry Pi:
+      * WINDOWS_REAL_CAMERA = True in config.py
+      * python main.py --windows-real-camera
+
+    HARDWARE_MODE always wins. On the Pi this returns False no matter what
+    the flag or the command line says, so the hardware path cannot be
+    disturbed by a setting left switched on from a Windows session.
+    """
+    if HARDWARE_MODE:
+        return False
+    return WINDOWS_REAL_CAMERA or ("--windows-real-camera" in sys.argv)
+
+
+def _open_windows_webcam(index: int = WINDOWS_CAMERA_INDEX):
+    """Open a USB / laptop webcam through OpenCV. Never Picamera2.
+
+    Returns the VideoCapture, or None with the reason printed. isOpened()
+    alone is not trusted -- a device can open and still deliver nothing,
+    so a frame must actually arrive before the camera is accepted.
+    """
+    backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
+    cap = cv2.VideoCapture(index, backend)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        print(f"[main] ERROR: webcam index {index} would not open.")
+        print("[main]        Close Teams/Zoom/Camera app, or set "
+              "WINDOWS_CAMERA_INDEX in config.py (try 1).")
+        return None
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    ok, probe = cap.read()
+    if not ok or probe is None:
+        cap.release()
+        print(f"[main] ERROR: webcam {index} opened but delivered no frame.")
+        return None
+
+    print(f"[main] Windows webcam {index} live -- "
+          f"{probe.shape[1]}x{probe.shape[0]} BGR")
+    return cap
 from modules.encoder_sim import EncoderSim
 from modules.imu_sim import IMUSim
 from modules.camera_sim import CameraSim
@@ -110,12 +159,15 @@ def main() -> None:
 
     # -- SLAM engine: robot always starts by mapping
     sim_mode = SimMode.MAPPING
-    if HARDWARE_MODE:
-        # No ground truth exists on a real floor. Withholding it forces
-        # frontier exploration onto the grid the robot actually built,
-        # which is the entire point of mapping a real room.
+    real_camera = _windows_real_camera_enabled()
+
+    if HARDWARE_MODE or real_camera:
+        # No ground truth exists for a real floor. Withholding it forces
+        # frontier exploration onto the grid actually built from camera
+        # observations, and guarantees the grid starts empty.
         slam: Optional[SLAMEngine] = SLAMEngine()
-        print("[main] Phase 1: SLAM MAPPING -- REAL sensors, empty map")
+        label = "REAL sensors" if HARDWARE_MODE else "WINDOWS REAL CAMERA"
+        print(f"[main] Phase 1: SLAM MAPPING -- {label}, empty map")
     else:
         slam = SLAMEngine(ground_truth_free_fn=map_loader.is_free)
         print("[main] Phase 1: SLAM MAPPING -- robot exploring environment...")
@@ -155,7 +207,42 @@ def main() -> None:
         camera = CameraSim()
         motor = MotorDriverSim()
         bump = BumpSwitchSim()
-        perception = None          # simulation path unchanged
+
+        perception = None          # default: simulation path unchanged
+        _win_cap = None
+        if real_camera:
+            # Windows real-camera perception. No Picamera2, no GPIO, no I2C:
+            # only the OpenCV webcam is added. Motion, IMU and encoders stay
+            # simulated exactly as before.
+            print("[main] WINDOWS_REAL_CAMERA=True -- webcam feeds perception; "
+                  "motion stays simulated")
+            _win_cap = _open_windows_webcam()
+            if _win_cap is None:
+                # SLAM was built without ground truth in anticipation of real
+                # observations. With no camera, nothing would ever populate
+                # the grid and frontier exploration would have no free space
+                # to plan through -- so revert fully to the simulation
+                # configuration rather than run a half-configured hybrid.
+                print("[main] Falling back to normal simulation "
+                      "(synthetic perception, ground-truth map restored).")
+                real_camera = False
+                slam = SLAMEngine(ground_truth_free_fn=map_loader.is_free)
+            else:
+                from robot.aruco_docking import load_camera_calibration
+                _K, _D, _calibrated = load_camera_calibration()
+                if not _calibrated:
+                    print("[main] WARNING: no camera calibration found.")
+                    print("[main]          Segmentation diagnostics are still "
+                          "meaningful, but RANGES ARE NOT METRIC and the map")
+                    print("[main]          must not be read as accurate. Run: "
+                          "python calibration.py --capture")
+                perception = CameraPerceptionSource(
+                    capture=_win_cap,
+                    camera_matrix=_K if _calibrated else None,
+                    dist_coeffs=_D if _calibrated else None,
+                )
+                print(f"[main] Perception: live webcam IPM ranges "
+                      f"(calibrated={_calibrated})")
 
     # Shared generic modules
     localizer = Localizer()
@@ -319,7 +406,12 @@ def main() -> None:
                 # Reuse enc_reading from step 4 — no second encoder.update()
                 real_scan = None
                 if perception is not None:
-                    perception._cap.latest = cam_frame
+                    # On hardware the relay shares the frame CameraHW already
+                    # grabbed (the CSI sensor allows one consumer). On Windows
+                    # the perception source owns its own VideoCapture and
+                    # reads the webcam directly.
+                    if isinstance(getattr(perception, "_cap", None), _FrameRelay):
+                        perception._cap.latest = cam_frame
                     real_scan = perception.get_scan(
                         motor.x, motor.y, motor.theta)
 
@@ -588,6 +680,9 @@ def main() -> None:
     else:
         imu.stop()
         camera.release()
+        if perception is not None and _win_cap is not None:
+            _win_cap.release()
+            print("[main] Windows webcam released.")
 
     planner.save_agent()
     print(f"[main] Q-Learning stats: {planner.q_agent.get_stats()}")
