@@ -90,7 +90,7 @@ class _Picamera2Source(FrameSource):
     name = "picamera2"
 
     def __init__(self) -> None:
-        from picamera2 import Picamera2
+        from picamera2 import Picamera2 # type: ignore
 
         self._picam = Picamera2()
         config = self._picam.create_video_configuration(
