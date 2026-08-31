@@ -14,6 +14,7 @@ from typing import List, Tuple
 # ════════════════════════════════════════════════
 # DEPLOYMENT MODE
 # ════════════════════════════════════════════════
+<<<<<<< HEAD
 def _detect_raspberry_pi() -> bool:
     """True only when actually running on Raspberry Pi hardware.
 
@@ -39,6 +40,9 @@ def _detect_raspberry_pi() -> bool:
 
 
 HARDWARE_MODE: bool = _detect_raspberry_pi()
+=======
+HARDWARE_MODE: bool = True                 # Set to True when running on the physical Raspberry Pi
+>>>>>>> a36425c87d1a4ac3c2b1283f61dc5d2ea48b624b
 
 # Windows real-camera perception mode.
 #
