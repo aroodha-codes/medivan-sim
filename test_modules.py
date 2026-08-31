@@ -262,3 +262,182 @@ class TestDeliveryQueue:
         dq = DeliveryQueue()
         assert dq.current_goal is None
         assert dq.is_empty is True
+
+
+# ══════════════════════════════════════════════════════════════
+# BATTERY SENSING (ADS1115 + INA219)
+# ══════════════════════════════════════════════════════════════
+
+class TestBatterySensing:
+    """2S pack voltage model, state classification and failure handling.
+
+    None of these require physical hardware: BatterySim exposes the same
+    interface as BatteryHW, and failure paths are exercised by its `fail`
+    flag rather than by unplugging anything.
+    """
+
+    # ── 2S voltage-to-percentage model ─────────────────────────
+    def test_full_pack_is_8v4_not_4v2(self):
+        from modules.battery_manager import voltage_to_percent
+        assert voltage_to_percent(8.4) == 100.0
+        # A 1S curve would call 4.2 V full. On this 2S pack 4.2 V is a
+        # deeply over-discharged state, well below the empty threshold.
+        assert voltage_to_percent(4.2) == 0.0
+
+    def test_nominal_and_empty(self):
+        from modules.battery_manager import voltage_to_percent
+        assert voltage_to_percent(7.4) == pytest.approx(45.0, abs=1.0)
+        assert voltage_to_percent(6.0) == 0.0
+        assert voltage_to_percent(5.0) == 0.0      # clamps, no negatives
+
+    def test_curve_is_monotonic(self):
+        from modules.battery_manager import voltage_to_percent
+        prev = -1.0
+        for mv in range(6000, 8401, 50):
+            pct = voltage_to_percent(mv / 1000.0)
+            assert pct >= prev, f"non-monotonic at {mv/1000:.2f} V"
+            prev = pct
+
+    def test_load_compensation_raises_estimate(self):
+        from modules.battery_manager import compensate_for_load
+        # Under 1.3 A of draw a sagging pack reads low; compensation adds
+        # I*R back. Charging (negative current) must NOT be compensated.
+        assert compensate_for_load(7.0, 1.3, 0.10) == pytest.approx(7.13)
+        assert compensate_for_load(7.0, -0.9, 0.10) == 7.0
+
+    # ── state classification ───────────────────────────────────
+    def _settle(self, mgr, sim, polls=6):
+        state = None
+        for _ in range(polls):
+            state = mgr.update_from_sensor(sim.read())
+        return state
+
+    def test_discharging_state(self):
+        from modules.battery_manager import BatteryManager, BatteryState
+        from modules.battery_sim import BatterySim
+        mgr, sim = BatteryManager(), BatterySim(seed=1)
+        sim.set_state(75.0, moving=True)
+        assert self._settle(mgr, sim) is BatteryState.DISCHARGING
+
+    def test_charging_state_from_current_direction(self):
+        from modules.battery_manager import BatteryManager, BatteryState
+        from modules.battery_sim import BatterySim
+        mgr, sim = BatteryManager(), BatterySim(seed=1)
+        sim.set_state(60.0, charging=True)
+        assert self._settle(mgr, sim) is BatteryState.CHARGING
+
+    def test_full_requires_taper_not_just_voltage(self):
+        from modules.battery_manager import BatteryManager, BatteryState
+        from modules.battery_sim import BatterySim
+        mgr, sim = BatteryManager(), BatterySim(seed=1)
+        sim.set_state(99.0, charging=True)     # current has tapered
+        assert self._settle(mgr, sim) is BatteryState.FULL
+
+    def test_low_state(self):
+        from modules.battery_manager import BatteryManager, BatteryState
+        from modules.battery_sim import BatterySim
+        mgr, sim = BatteryManager(), BatterySim(seed=1)
+        sim.set_state(25.0, moving=True)
+        assert self._settle(mgr, sim) is BatteryState.LOW
+
+    def test_critical_state(self):
+        from modules.battery_manager import BatteryManager, BatteryState
+        from modules.battery_sim import BatterySim
+        mgr, sim = BatteryManager(), BatterySim(seed=1)
+        sim.set_state(8.0, moving=False)
+        assert self._settle(mgr, sim) is BatteryState.CRITICAL
+
+    # ── failure handling ───────────────────────────────────────
+    def test_sensor_failure_degrades_to_unknown(self):
+        from modules.battery_manager import BatteryManager, BatteryState
+        from modules.battery_sim import BatterySim
+        mgr, sim = BatteryManager(), BatterySim(seed=1)
+        sim.set_state(70.0, moving=True)
+        self._settle(mgr, sim)
+        sim.fail = True
+        assert self._settle(mgr, sim, polls=5) is BatteryState.UNKNOWN
+        assert mgr.sensed_pct is None          # no fabricated percentage
+        assert mgr.has_sensor_data is False
+
+    def test_single_dropped_read_does_not_blank_state(self):
+        from modules.battery_manager import (BatteryManager, BatteryState,
+                                             BatteryReading)
+        from modules.battery_sim import BatterySim
+        mgr, sim = BatteryManager(), BatterySim(seed=1)
+        sim.set_state(70.0, moving=True)
+        before = self._settle(mgr, sim)
+        mgr.update_from_sensor(BatteryReading(valid=False))
+        assert mgr.state is before             # one glitch is tolerated
+
+    def test_invalid_reading_reports_no_voltage(self):
+        from modules.battery_sim import BatterySim
+        sim = BatterySim(seed=1)
+        sim.fail = True
+        r = sim.read()
+        assert r.valid is False
+
+    # ── admission rules still hold on sensed values ────────────
+    def test_mission_rejected_below_threshold(self):
+        from modules.battery_manager import BatteryManager, BatteryVerdict
+        mgr = BatteryManager()
+        assert mgr.may_accept(45.0) is True
+        assert mgr.may_accept(20.0) is False
+        v = mgr.evaluate(20.0, mission_active=False)
+        assert v is BatteryVerdict.REJECT_LOW
+
+    def test_low_battery_mid_mission_finishes_then_docks(self):
+        from modules.battery_manager import BatteryManager, BatteryVerdict
+        mgr = BatteryManager()
+        v = mgr.evaluate(20.0, mission_active=True)
+        assert v is BatteryVerdict.FINISH_THEN_DOCK
+        assert mgr.lockout is True
+
+    def test_charge_stops_at_95(self):
+        from modules.battery_manager import BatteryManager
+        mgr = BatteryManager()
+        pct, status = mgr.charge_step(95.0, 1.0)
+        assert status.complete is True and status.charging is False
+        assert pct <= 95.0
+
+    # ── simulator / hardware selection ─────────────────────────
+    def test_simulator_needs_no_hardware(self):
+        from modules.battery_sim import BatterySim
+        sim = BatterySim(seed=1)
+        sim.set_state(50.0)
+        r = sim.read()
+        assert r.valid and 6.0 <= r.voltage <= 8.6 and r.source == "sim"
+
+    def test_hardware_module_imports_without_i2c(self):
+        # Importing must not require a bus; construction reports
+        # unavailable rather than raising.
+        from hardware.battery_hw import BatteryHW, ADS1115, INA219
+        assert BatteryHW is not None
+
+    def test_percent_to_voltage_round_trip(self):
+        from modules.battery_sim import percent_to_voltage
+        from modules.battery_manager import voltage_to_percent
+        for pct in (0.0, 25.0, 50.0, 75.0, 100.0):
+            assert voltage_to_percent(percent_to_voltage(pct)) == \
+                pytest.approx(pct, abs=1.0)
+
+    # ── telemetry ──────────────────────────────────────────────
+    def test_telemetry_exposes_battery_fields(self):
+        from modules.mission_controller import MissionController
+        from modules.battery_sim import BatterySim
+        mc = MissionController(seed=1, n_deliveries=0, use_saved_map=False,
+                               battery_sensor=BatterySim(seed=1))
+        mc.step()
+        t = mc.telemetry()
+        for f in ("battery_voltage", "battery_current", "battery_power",
+                  "battery_state", "charging", "battery_sensed"):
+            assert hasattr(t, f), f"telemetry missing {f}"
+
+    def test_telemetry_without_sensor_reports_unknown(self):
+        from modules.mission_controller import MissionController
+        mc = MissionController(seed=1, n_deliveries=0, use_saved_map=False)
+        mc.step()
+        t = mc.telemetry()
+        # No sensor attached: no fabricated readings.
+        assert t.battery_voltage is None
+        assert t.battery_state == "unknown"
+        assert t.battery_sensed is False

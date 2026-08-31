@@ -92,6 +92,12 @@
     if (trace.buf.length > 90) trace.buf.shift();
 
     $('#vBattery').textContent  = fmt(s.battery_pct, 0) + '%';
+    // Battery sensing (ADS1115 + INA219). fmt() renders an em dash for
+    // null, so an unavailable sensor shows '—' rather than a misleading 0.
+    $('#vVoltage').textContent  = s.battery_voltage == null ? '—' : fmt(s.battery_voltage, 2) + ' V';
+    $('#vCurrent').textContent  = s.battery_current == null ? '—' : fmt(s.battery_current, 2) + ' A';
+    $('#vPower').textContent    = s.battery_power   == null ? '—' : fmt(s.battery_power, 2) + ' W';
+    $('#vBattState').textContent = titleCase(s.battery_state || 'unknown');
     $('#vCoverage').textContent = fmt(s.coverage_pct, 0) + '%';
     $('#vSpeed').textContent    = fmt(s.speed_ms, 2);
     $('#vState').textContent    = titleCase(s.state);

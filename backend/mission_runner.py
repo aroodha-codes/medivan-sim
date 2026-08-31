@@ -61,7 +61,7 @@ _EVENT_STYLE = {
     "emergency_stop":               ("bad",  "Emergency stop"),
 }
 
-_SERIES_KEYS = ("coverage", "battery", "cpu", "ram", "fps",
+_SERIES_KEYS = ("coverage", "battery", "voltage", "current", "cpu", "ram", "fps",
                 "speed", "drift", "path")
 
 
@@ -245,6 +245,8 @@ class MissionRunner:
         push = {
             "coverage": round(t.coverage_pct, 1),
             "battery": round(t.battery_pct, 1),
+            "voltage": t.battery_voltage,
+            "current": t.battery_current,
             "cpu": self._proc["cpu_pct"],
             "ram": self._proc["ram_mb"],
             "fps": round(self._loop_hz, 1),
@@ -288,6 +290,18 @@ class MissionRunner:
             "heading_deg": round(t.heading_deg, 1),
             "speed_ms": round(t.speed_ms, 3),
             "battery_pct": round(t.battery_pct, 1),
+            # ── battery sensing (ADS1115 + INA219) ──
+            # None when no sensor is attached or the read failed. The
+            # dashboard renders an em dash rather than a zero, so a bus
+            # glitch cannot look like a flat battery.
+            "battery_voltage": t.battery_voltage,
+            "battery_current": t.battery_current,
+            "battery_power": t.battery_power,
+            "battery_state": t.battery_state,
+            "charging": t.charging,
+            #: False means battery_pct is the simulation's own counter, not
+            #: a measurement. These must not be presented as equivalent.
+            "battery_sensed": t.battery_sensed,
             "coverage_pct": round(t.coverage_pct, 1),
             "localization_confidence": round(t.localization_confidence, 3),
             "position_uncertainty_px": round(t.position_uncertainty_px, 2),

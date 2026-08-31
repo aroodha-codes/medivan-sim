@@ -14,7 +14,31 @@ from typing import List, Tuple
 # ════════════════════════════════════════════════
 # DEPLOYMENT MODE
 # ════════════════════════════════════════════════
-HARDWARE_MODE: bool = False                 # Set to True when running on the physical Raspberry Pi
+def _detect_raspberry_pi() -> bool:
+    """True only when actually running on Raspberry Pi hardware.
+
+    One config.py is shared by the Windows development machine and the Pi
+    through git, so a hardcoded HARDWARE_MODE flips every time the other
+    machine pushes. That fails LOUDLY on Windows (gpiozero raises
+    BadPinFactory) and QUIETLY on the Pi -- simulated drivers load and no
+    motor ever turns. Detection reads the device-tree model, present on
+    Raspberry Pi OS and absent elsewhere. Conservative: anything uncertain
+    returns False, so Windows never tries to claim GPIO.
+
+    Override:  MEDIVAN_HARDWARE=1 forces hardware, =0 forces simulation.
+    """
+    import os as _os
+    forced = _os.environ.get("MEDIVAN_HARDWARE")
+    if forced is not None:
+        return forced.strip() not in ("0", "false", "False", "")
+    try:
+        with open("/proc/device-tree/model") as _f:
+            return "raspberry pi" in _f.read().lower()
+    except OSError:
+        return False
+
+
+HARDWARE_MODE: bool = _detect_raspberry_pi()
 
 # Windows real-camera perception mode.
 #
@@ -45,12 +69,12 @@ WINDOWS_CAMERA_INDEX: int = 0
 #    silently fell back to software PWM (jittery, CPU-bound).
 #    GPIO18 = PWM0 and GPIO19 = PWM1 are a valid independent pair, and this
 #    map now matches Figure 5.2 of the project report exactly.
-PIN_MOTOR_ENA: int = 32                     # Left PWM  -> hardware PWM0
-PIN_MOTOR_IN1: int = 29                     # Left Dir A
-PIN_MOTOR_IN2: int = 31                     # Left Dir B
-PIN_MOTOR_IN3: int = 33                     # Right Dir A
-PIN_MOTOR_IN4: int = 35                     # Right Dir B
-PIN_MOTOR_ENB: int = 12                     # Right PWM -> hardware PWM1
+PIN_MOTOR_ENA: int = 12                     # Left PWM  -> hardware PWM0
+PIN_MOTOR_IN1: int = 5                     # Left Dir A
+PIN_MOTOR_IN2: int = 6                     # Left Dir B
+PIN_MOTOR_IN3: int = 13                     # Right Dir A
+PIN_MOTOR_IN4: int = 19                     # Right Dir B
+PIN_MOTOR_ENB: int = 18                     # Right PWM -> hardware PWM1
 
 # I2C (IMU / ADC)
 PIN_I2C_SDA: int = 2
@@ -213,12 +237,144 @@ OBS_STOP_AREA_PX: int = 8000
 # BATTERY
 # ════════════════════════════════════════════════
 BATTERY_START_PCT: float = 100.0
-LOW_BAT_THRESHOLD: float = 25.0              # return to dock immediately
+# Return-to-dock threshold. MUST match BatteryManager.ACCEPT_PCT, which is
+# the single admission-control decision point -- these were 25.0 and 30.0
+# respectively, i.e. two different thresholds for the same decision.
+LOW_BAT_THRESHOLD: float = 30.0              # return to dock immediately
 EMERGENCY_BAT: float = 18.0                  # critical - force stop if not docked
 CHARGE_COMPLETE: float = 95.0
-DISCHARGE_MOVING: float = 0.003             # %/frame under load
-DISCHARGE_STANDBY: float = 0.001            # %/frame motors off
-CHARGE_RATE: float = 0.008                  # %/frame docked
+DISCHARGE_MOVING: float = 0.003             # %/frame under load (SIM ONLY)
+DISCHARGE_STANDBY: float = 0.001            # %/frame motors off  (SIM ONLY)
+CHARGE_RATE: float = 0.008                  # %/frame docked      (SIM ONLY)
+
+# ════════════════════════════════════════════════
+# BATTERY PACK & POWER SENSING (ADS1115 + INA219)
+# ════════════════════════════════════════════════
+# Pack: 2 x 18650 Li-ion in SERIES (2S1P).
+#   nominal   2 x 3.7 V = 7.4 V
+#   full      2 x 4.2 V = 8.4 V
+#   empty     2 x 3.0 V = 6.0 V   (protection cut-off territory)
+# A 1S curve (4.2 V = 100 %) would be wrong by a factor of two here.
+BATTERY_CELLS_SERIES: int = 2
+BATTERY_CELLS_PARALLEL: int = 1
+BATTERY_NOMINAL_V: float = 7.40
+BATTERY_FULL_V: float = 8.40
+BATTERY_EMPTY_V: float = 6.00
+
+# Voltage -> state-of-charge lookup for a 2S Li-ion pack, resting (no load).
+# Pairs are (pack_volts, percent), ascending. Linearly interpolated between
+# points. Li-ion discharge is markedly non-linear -- the long flat region
+# between roughly 40 % and 80 % is why a voltage-only estimate cannot be
+# precise in the mid range.
+#
+# THESE ARE GENERIC 18650 FIGURES, not measured from your cells. For an
+# accurate curve, discharge the pack at a low constant current and record
+# voltage against coulomb-counted charge removed. Until then the reported
+# percentage is an ESTIMATE and is documented as such.
+BATTERY_CURVE_2S: Tuple[Tuple[float, float], ...] = (
+    (6.00,   0.0),
+    (6.40,   5.0),
+    (6.80,  10.0),
+    (7.00,  20.0),
+    (7.20,  30.0),
+    (7.40,  45.0),
+    (7.60,  60.0),
+    (7.80,  75.0),
+    (8.00,  85.0),
+    (8.20,  95.0),
+    (8.40, 100.0),
+)
+
+# ── ADS1115: pack voltage via divider ────────────────────────────
+# The ADS1115 tolerates at most about VDD + 0.3 V on an input -- roughly
+# 3.6 V at 3.3 V VDD -- and the pack reaches 8.4 V, so a divider is
+# MANDATORY. Never wire pack voltage to an ADC or GPIO directly.
+ADS1115_ENABLED: bool = True
+ADS1115_I2C_BUS: int = 1
+ADS1115_I2C_ADDR: int = 0x48           # ADDR->GND. 0x49 VDD, 0x4A SDA, 0x4B SCL
+ADS1115_CHANNEL: int = 0               # single-ended A0
+ADS1115_GAIN_FS_VOLTS: float = 4.096   # +/-4.096 V full scale (PGA = 1)
+
+# Divider ratio = (R_top + R_bottom) / R_bottom. The ADC sees
+# V_pack / ratio, so V_pack = V_adc * ratio.
+#
+#   *** VERIFY THIS AGAINST YOUR ACTUAL RESISTORS ***
+# Default assumes R_top = 10k, R_bottom = 4.7k -> ratio 3.128, which maps
+# 8.4 V to 2.686 V at the ADC (safely inside the 4.096 V range).
+# With different resistors, set the values below and the ratio recomputes.
+ADS1115_DIVIDER_R_TOP_OHMS: float = 10000.0
+ADS1115_DIVIDER_R_BOTTOM_OHMS: float = 4700.0
+ADS1115_DIVIDER_RATIO: float = (
+    (ADS1115_DIVIDER_R_TOP_OHMS + ADS1115_DIVIDER_R_BOTTOM_OHMS)
+    / ADS1115_DIVIDER_R_BOTTOM_OHMS)
+
+# Multiplicative trim applied after the divider maths. Measure the pack with
+# a multimeter, compare against the reported voltage, and set
+#   ADS1115_CALIBRATION = V_multimeter / V_reported
+# Resistor tolerance alone (5 % parts) can shift the reading by several
+# percent, which is a large error in state-of-charge terms.
+ADS1115_CALIBRATION: float = 1.0
+
+# ── INA219: current, power, bus voltage ──────────────────────────
+INA219_ENABLED: bool = True
+INA219_I2C_BUS: int = 1
+INA219_I2C_ADDR: int = 0x40            # A0/A1 -> GND. 0x41, 0x44, 0x45 also common
+INA219_SHUNT_OHMS: float = 0.1         # 0.1 ohm on most breakout boards
+INA219_MAX_EXPECTED_A: float = 3.2     # calibration range; 2 motors + Pi
+
+# Sign convention: POSITIVE current = discharge (energy leaving the pack).
+# If your INA219 is wired with VIN+/VIN- reversed, the sign inverts; set
+# this True rather than rewiring.
+INA219_INVERT_CURRENT: bool = False
+
+# *** CRITICAL WIRING ASSUMPTION -- VERIFY ***
+# Charging can only be DETECTED if charge current physically flows through
+# the INA219 shunt, i.e. the sensor sits in series between the pack and
+# BOTH the load and the charger tie-in point. If the shunt is on the load
+# side only, charge current bypasses it, no negative current is ever seen,
+# and the state is reported as UNKNOWN rather than inferred from voltage.
+INA219_SEES_CHARGE_CURRENT: bool = True
+
+# ── State-detection thresholds ───────────────────────────────────
+# Charging: current more negative than this (energy entering the pack).
+BATTERY_CHARGE_CURRENT_A: float = -0.05
+# Discharging: current more positive than this.
+BATTERY_DISCHARGE_CURRENT_A: float = 0.05
+# FULL: at or above this percentage AND charge current has tapered.
+BATTERY_FULL_PCT: float = 95.0
+BATTERY_FULL_TAPER_A: float = 0.10
+# LOW / CRITICAL percentages. LOW matches LOW_BAT_THRESHOLD above.
+BATTERY_LOW_PCT: float = 30.0
+BATTERY_CRITICAL_PCT: float = 12.0
+
+# ── Filtering ────────────────────────────────────────────────────
+BATTERY_POLL_INTERVAL_S: float = 1.0   # sensor read cadence
+BATTERY_EMA_ALPHA: float = 0.20        # exponential smoothing on voltage
+# A state must hold for this many consecutive polls before it is reported.
+# Without it, PWM ripple and motor transients flip CHARGING/DISCHARGING
+# several times a second.
+BATTERY_STATE_HYSTERESIS_POLLS: int = 3
+# Percentage hysteresis: once LOW is entered, the pack must rise this far
+# above the threshold before LOW clears, so it cannot oscillate at the edge.
+BATTERY_PCT_HYSTERESIS: float = 3.0
+
+# Internal resistance of the pack, ohms, for load compensation.
+#   V_resting ~= V_measured + (I_discharge * R_internal)
+# Under motor load the terminal voltage sags, so an uncompensated reading
+# understates charge -- a pack at 60 % can read 30 % mid-drive and trigger a
+# premature return to dock. Two 18650 cells in series are typically
+# 0.05-0.15 ohm total including wiring.
+#
+# *** MEASURE THIS: record open-circuit voltage, apply a known load, record
+# the loaded voltage, then R = (V_open - V_loaded) / I_load. ***
+BATTERY_IR_COMPENSATION_OHMS: float = 0.10
+# Only trust the percentage estimate when current is below this, unless IR
+# compensation is enabled. Voltage-based SoC is only meaningful at rest.
+BATTERY_REST_CURRENT_A: float = 0.15
+
+# Consecutive failed sensor reads before the battery state is declared
+# UNKNOWN. One dropped I2C transaction should not blank the dashboard.
+BATTERY_SENSOR_FAIL_LIMIT: int = 3
 
 # ════════════════════════════════════════════════
 # DOCK

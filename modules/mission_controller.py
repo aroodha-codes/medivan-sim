@@ -52,6 +52,7 @@ if __name__ == "__main__":
 from collections import deque
 
 from config import (
+    BATTERY_POLL_INTERVAL_S,
     MAP_PATH, MotorCommand, MotorDirection, VehicleState, CellType,
     MAP_SCALE_M_PER_PX, SLAM_CONFIDENCE_THRESHOLD, SLAM_GRID_RESOLUTION,
 )
@@ -64,7 +65,8 @@ from modules.path_planner import PathPlanner
 from modules.delivery_queue import DeliveryQueue
 from modules.perception_source import SimulationPerceptionSource
 from modules.map_store import MapStore
-from modules.battery_manager import BatteryManager, BatteryVerdict
+from modules.battery_manager import (BatteryManager, BatteryVerdict,
+                                     BatteryState, BatteryReading)
 
 
 def _iso(epoch: float) -> Optional[str]:
@@ -131,6 +133,20 @@ class MissionTelemetry:
     #: exists on hardware.
     position_uncertainty_px: float = 0.0
 
+    #: ── battery sensing (ADS1115 + INA219) ──
+    #: Measured pack voltage, current and power. None when no sensor is
+    #: attached or the read failed -- never a fabricated value.
+    battery_voltage: Optional[float] = None      # volts (2S pack: 6.0-8.4)
+    battery_current: Optional[float] = None      # amps; POSITIVE = discharge
+    battery_power: Optional[float] = None        # watts
+    #: unknown | discharging | charging | full | low | critical
+    battery_state: str = "unknown"
+    charging: bool = False
+    #: True when battery_pct came from a sensor; False when it is the
+    #: simulation's own counter. The dashboard must not present the two as
+    #: equivalent.
+    battery_sensed: bool = False
+
     #: True |estimate - ground truth| in pixels. SIMULATOR ONLY -- None on
     #: hardware, where no ground truth exists. Never merged into any other
     #: field.
@@ -187,7 +203,8 @@ class MissionController:
                  explore_budget: int = 2500,
                  nav_timeout: int = 3500,
                  on_event: Optional[Callable[[str, dict], None]] = None,
-                 record_trail: int = 0) -> None:
+                 record_trail: int = 0,
+                 battery_sensor=None) -> None:
         self.rng = np.random.default_rng(seed)
         self.n_deliveries = n_deliveries
         self.explore_budget = explore_budget
@@ -215,6 +232,11 @@ class MissionController:
         self.planner = PathPlanner()
         self.deliveries = DeliveryQueue()
         self.battery_mgr = BatteryManager()
+        #: Optional battery sensor (BatteryHW on the Pi, BatterySim
+        #: otherwise). None keeps the original simulated-percentage
+        #: behaviour exactly as before -- see step().
+        self.battery_sensor = battery_sensor
+        self._battery_poll_t = 0.0
         self.map_store = MapStore(name=map_name)
         self.skip_exploration = False
         self.loaded_map_meta = None
@@ -306,7 +328,17 @@ class MissionController:
             uptime_s=time.time() - self._t_start,
             deliveries_total=self.deliveries.total_deliveries,
             position_uncertainty_px=self.position_uncertainty_px,
-            ground_truth_error=self.ground_truth_error)
+            ground_truth_error=self.ground_truth_error,
+            # ── battery sensing ──
+            battery_voltage=(round(self.battery_mgr.reading.voltage, 3)
+                             if self.battery_mgr.reading.valid else None),
+            battery_current=(round(self.battery_mgr.reading.current, 3)
+                             if self.battery_mgr.reading.valid else None),
+            battery_power=(round(self.battery_mgr.reading.power, 3)
+                           if self.battery_mgr.reading.valid else None),
+            battery_state=self.battery_mgr.state.value,
+            charging=self.battery_mgr.state is BatteryState.CHARGING,
+            battery_sensed=self.battery_mgr.has_sensor_data)
 
     # ══════════════════════════════════════════════════════════════
     # ADDITIVE DASHBOARD / OPERATOR SURFACE
@@ -629,9 +661,14 @@ class MissionController:
                              self.est[0], self.est[1], self.est[2],
                              None, scan=scan)
 
-        # battery: idle drain plus motion cost
+        # ── battery ────────────────────────────────────────────
+        # With a sensor attached, the percentage comes from measurement.
+        # Without one, the original simulated drain runs unchanged.
         moving = abs(self.motor.forward_v) > 1e-3
-        self.battery = max(0.0, self.battery - (0.004 if moving else 0.001))
+        if self.battery_sensor is not None:
+            self._update_battery_from_sensor(moving)
+        else:
+            self._simulated_battery_drain(moving)
 
         self._prev = (self.motor.x, self.motor.y, self.motor.theta)
         self._pos_err.append(math.hypot(self.est[0] - self.motor.x,
@@ -648,6 +685,38 @@ class MissionController:
                                     round(self.est[1], 1)))
 
         self._tick_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    def _update_battery_from_sensor(self, moving: bool) -> None:
+        """Poll the battery sensor and fold the reading into the manager.
+
+        Polling is rate-limited to BATTERY_POLL_INTERVAL_S: an I2C
+        transaction costs milliseconds and the pack cannot change
+        meaningfully at 30 Hz.
+
+        If the sensor degrades to UNKNOWN, self.battery is LEFT AT ITS LAST
+        KNOWN VALUE rather than zeroed or invented. Zeroing would trigger a
+        spurious critical-battery abort from a bus glitch; the UNKNOWN state
+        is surfaced in telemetry so an operator can see the data is stale.
+        """
+        now = time.time()
+        if now - self._battery_poll_t < BATTERY_POLL_INTERVAL_S:
+            return
+        self._battery_poll_t = now
+
+        # Keep a simulated sensor in step with the simulation's own charge.
+        if hasattr(self.battery_sensor, "set_state"):
+            self.battery_sensor.set_state(
+                self.battery, moving=moving,
+                charging=self.state == MissionState.CHARGING)
+
+        reading = self.battery_sensor.read()
+        self.battery_mgr.update_from_sensor(reading)
+        if self.battery_mgr.has_sensor_data:
+            self.battery = self.battery_mgr.sensed_pct
+
+    def _simulated_battery_drain(self, moving: bool) -> None:
+        """Original simulated drain. Unchanged behaviour."""
+        self.battery = max(0.0, self.battery - (0.004 if moving else 0.001))
 
     # ── state machine ──────────────────────────────────────────
 
