@@ -186,7 +186,7 @@ python main.py
 
 ## 📜 License
 
-This project was developed as a Major Project by **Karthik N**.
+This project was developed as a Major Project by **SIDDHAROODHA and TEAM**.
 
 Technology Stack: Python 3.10+ | OpenCV | Pygame | NumPy  
 Target Platform: Raspberry Pi 4 (ARM Cortex-A72)
