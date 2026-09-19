@@ -14,7 +14,6 @@ from typing import List, Tuple
 # ════════════════════════════════════════════════
 # DEPLOYMENT MODE
 # ════════════════════════════════════════════════
-<<<<<<< HEAD
 def _detect_raspberry_pi() -> bool:
     """True only when actually running on Raspberry Pi hardware.
 
@@ -40,9 +39,7 @@ def _detect_raspberry_pi() -> bool:
 
 
 HARDWARE_MODE: bool = _detect_raspberry_pi()
-=======
 HARDWARE_MODE: bool = True                 # Set to True when running on the physical Raspberry Pi
->>>>>>> a36425c87d1a4ac3c2b1283f61dc5d2ea48b624b
 
 # Windows real-camera perception mode.
 #
@@ -76,8 +73,8 @@ WINDOWS_CAMERA_INDEX: int = 0
 PIN_MOTOR_ENA: int = 12                     # Left PWM  -> hardware PWM0
 PIN_MOTOR_IN1: int = 5                     # Left Dir A
 PIN_MOTOR_IN2: int = 6                     # Left Dir B
-PIN_MOTOR_IN3: int = 13                     # Right Dir A
-PIN_MOTOR_IN4: int = 19                     # Right Dir B
+PIN_MOTOR_IN3: int = 19                   # Right Dir A
+PIN_MOTOR_IN4: int = 13                     # Right Dir B
 PIN_MOTOR_ENB: int = 18                     # Right PWM -> hardware PWM1
 
 # I2C (IMU / ADC)
