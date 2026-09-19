@@ -254,7 +254,7 @@ def main() -> None:
     logger = DataLogger(log_dir=PROJECT_ROOT)
     delivery = DeliveryQueue()
 
-  # -- Initial state ───────────────────────────
+# -- Initial state ───────────────────────────
 if HARDWARE_MODE:
     # Real unknown environment: start at centre of empty map.
     start_pos = (MAP_WIDTH // 2, MAP_HEIGHT // 2)
@@ -270,6 +270,7 @@ slam.initialize(start_pos[0], start_pos[1], start_theta)
 
 if HARDWARE_MODE:
     imu.snap_yaw(start_theta)
+
     # Navigation goal (used after SLAM completes)
     goal = map_loader.dock_position or (700, 295)
 
@@ -390,14 +391,6 @@ if HARDWARE_MODE:
                 enc_dtheta=enc_reading.dtheta,
                 prev_gray=prev_gray,
                 curr_gray=curr_gray,
-                is_free_fn=map_loader.is_free,
-                junctions=map_loader.junctions,
-            )vehicle_state = localizer.update(
-                enc_dx=enc_reading.dx_px,
-                enc_dy=enc_reading.dy_px,
-                enc_dtheta=enc_reading.dtheta,
-                prev_gray=prev_gray,
-                curr_gray=curr_gray,
 
                 # Never use hospital_map.png as ground truth on real hardware.
                 is_free_fn=None if HARDWARE_MODE else map_loader.is_free,
@@ -453,12 +446,26 @@ if HARDWARE_MODE:
                     scan=real_scan,
                 )
                 if slam.mapping_complete:
+                    if HARDWARE_MODE:
+                        print("[main] REAL MAP EXPLORATION COMPLETE")
+
+                        slam.save_map()
+
+                        motor.emergency_stop()
+
+                        print("[main] Robot stopped.")
+                        print("[main] Map saved to output/slam_map.png")
+
+                        running = False
+
+                else:
                     print("[main] SLAM complete! Phase 2: NAVIGATION")
+
                     sim_mode = SimMode.NAVIGATION
                     pygame.display.set_caption("MediVan -- AI Navigation")
-                    # Reload the SLAM-built map for A* navigation
+
                     map_loader.load_map(map_path)
-                    # Plan first path using the SLAM-built map
+
                     planner.plan_path(
                         start=(int(vehicle_state.x), int(vehicle_state.y)),
                         goal=goal,
@@ -468,8 +475,10 @@ if HARDWARE_MODE:
                         map_width=map_loader.width,
                         map_height=map_loader.height,
                     )
+
                     print(f"[main] First path: {len(planner.path)} waypoints")
-                    slam = None  # free memory
+
+                    slam = None
             except Exception as e:
                 print(f"[main] SLAM error: {e}")
 
@@ -527,34 +536,56 @@ if HARDWARE_MODE:
             if manual_cmd is not None:
                 motor_cmd = manual_cmd
             elif sim_mode == SimMode.MAPPING and slam is not None:
-                # SLAM exploration: wall-following
+                # Real robot explores its own occupancy grid.
                 motor_cmd = slam.get_explore_command(
-                    motor.x, motor.y, motor.theta, map_loader.is_free)
+                    motor.x,
+                    motor.y,
+                    motor.theta,
+                    None if HARDWARE_MODE else map_loader.is_free,
+                )
             elif motor.mode == DriveMode.AUTONOMOUS and not motor.emergency_stopped:
                 motor_cmd = planner.follow_path(
                     vehicle_state, grid_fn=grid_fn, obstacles=obstacles,
                     battery_pct=dock.battery_pct)
-
-                # Obstacle action override
-                worst_action = ObstacleAction.NOMINAL
-                for obs in obstacles:
-                    if obs.action.value == "stop":
-                        worst_action = ObstacleAction.STOP
-                        break
-                    elif obs.action.value == "slow":
-                        worst_action = ObstacleAction.SLOW
-
-                if worst_action == ObstacleAction.STOP:
-                    from config import MotorDirection
-                    motor_cmd = MotorCommand(0, 0,
-                                             MotorDirection.BRAKE, MotorDirection.BRAKE)
-                    audio.play(AudioEvent.OBSTACLE_WARNING)
-                elif worst_action == ObstacleAction.SLOW:
-                    motor_cmd.pwm_a = int(motor_cmd.pwm_a * 0.4)
-                    motor_cmd.pwm_b = int(motor_cmd.pwm_b * 0.4)
-
+                
         except Exception as e:
             print(f"[main] Planner error: {e}")
+
+        # ============================================================
+        # GLOBAL YOLO OBSTACLE SAFETY
+        # Works during MAPPING as well as NAVIGATION.
+        # ============================================================
+        if motor.mode == DriveMode.AUTONOMOUS:
+
+            worst_action = ObstacleAction.NOMINAL
+
+            for obs in obstacles:
+
+                if obs.action == ObstacleAction.STOP:
+                    worst_action = ObstacleAction.STOP
+                    break
+
+                elif obs.action == ObstacleAction.SLOW:
+                    worst_action = ObstacleAction.SLOW
+
+            if worst_action == ObstacleAction.STOP:
+
+                from config import MotorDirection
+
+                motor_cmd = MotorCommand(
+                    0,
+                    0,
+                    MotorDirection.BRAKE,
+                    MotorDirection.BRAKE,
+                )
+
+                audio.play(AudioEvent.OBSTACLE_WARNING)
+
+            elif worst_action == ObstacleAction.SLOW:
+
+                motor_cmd.pwm_a = int(motor_cmd.pwm_a * 0.4)
+                motor_cmd.pwm_b = int(motor_cmd.pwm_b * 0.4)
+
 
         # Vibration cap
         motor_cmd.pwm_a = min(motor_cmd.pwm_a, vib_pwm_cap)
@@ -577,45 +608,87 @@ if HARDWARE_MODE:
         # 7. BUMP SWITCHES — safety override
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         try:
-            bump_state = bump.check(motor.x, motor.y, motor.theta,
-                                     map_loader.is_free)
-            if bump.is_reversing:
-                rev_cmd = bump.get_reverse_command()
-                motor.set_pwm(rev_cmd)
-                audio.play(AudioEvent.BUMP_CONTACT)
+
+            if HARDWARE_MODE:
+
+                # No physical bump switch is installed yet.
+                # Never use hospital_map.png to fake contact
+                # on the real robot.
+                bump_state = BumpState()
+
+            else:
+
+                bump_state = bump.check(
+                    motor.x,
+                    motor.y,
+                    motor.theta,
+                    map_loader.is_free,
+                )
+
+                if bump.is_reversing:
+
+                    rev_cmd = bump.get_reverse_command()
+                    motor.set_pwm(rev_cmd)
+
+                    audio.play(AudioEvent.BUMP_CONTACT)
+
         except Exception:
+
             bump_state = BumpState()
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 8. CHARGING DOCK — FSM update
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         try:
-            dock_cmd = dock.update(
-                vehicle_state=vehicle_state,
-                dock_result=dock_result,
-                motors_active=(motor.forward_v != 0),
-                dt=dt,
-            )
-            if dock_cmd is not None:
-                motor.set_pwm(dock_cmd)
 
-            # Battery alerts
-            if dock.battery_pct < LOW_BAT_THRESHOLD:
-                audio.play(AudioEvent.LOW_BATTERY)
-                hud.set_alert(f"LOW BATTERY {dock.battery_pct:.0f}% - RETURNING TO DOCK", 2.0)
-            if dock.state == DockState.CHARGED:
-                audio.play(AudioEvent.DOCK_COMPLETE)
+            # Do not allow the simulated docking FSM to override
+            # frontier exploration during a real mapping run.
+            if not (HARDWARE_MODE and sim_mode == SimMode.MAPPING):
+
+                dock_cmd = dock.update(
+                    vehicle_state=vehicle_state,
+                    dock_result=dock_result,
+                    motors_active=(motor.forward_v != 0),
+                    dt=dt,
+                )
+
+                if dock_cmd is not None:
+                    motor.set_pwm(dock_cmd)
+
+                if dock.battery_pct < LOW_BAT_THRESHOLD:
+
+                    audio.play(AudioEvent.LOW_BATTERY)
+
+                    hud.set_alert(
+                        f"LOW BATTERY {dock.battery_pct:.0f}% - RETURNING TO DOCK",
+                        2.0,
+                    )
+
+                if dock.state == DockState.CHARGED:
+                    audio.play(AudioEvent.DOCK_COMPLETE)
+
         except Exception as e:
+
             print(f"[main] Dock error: {e}")
 
         # IMU bump injection at bump zones
         try:
-            for bz in map_loader.bump_zones:
-                dist = math.sqrt((motor.x - bz[0])**2 + (motor.y - bz[1])**2)
-                if dist < 15:
-                    imu.inject_bump(2.0)
-                    break
+
+            if not HARDWARE_MODE:
+
+                for bz in map_loader.bump_zones:
+
+                    dist = math.sqrt(
+                        (motor.x - bz[0])**2 +
+                        (motor.y - bz[1])**2
+                    )
+
+                    if dist < 15:
+                        imu.inject_bump(2.0)
+                        break
+
         except Exception:
+
             pass
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -695,8 +768,28 @@ if HARDWARE_MODE:
     # SHUTDOWN
     # ════════════════════════════════════════════
     print("\n[main] Shutting down...")
+
+    # Stop motors first.
     motor.emergency_stop()
-    
+
+    # Save even an incomplete map.
+    if slam is not None:
+
+        try:
+
+            slam.save_map()
+
+            print(
+                "[main] Current SLAM map saved before exit."
+            )
+
+        except Exception as e:
+
+            print(
+                f"[main] Could not save SLAM map: {e}"
+            )
+
+
     if HARDWARE_MODE:
         motor.cleanup()
         imu.cleanup()

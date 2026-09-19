@@ -242,10 +242,21 @@ class SLAMEngine:
         # bounded fallback that prevents the robot mapping forever.
         # NOTE: the handed-over map may therefore be PARTIAL. See
         # EVALUATION_REPORT.md - "Known limitation: exploration completeness".
-        if (not _warmup
-                and (self._no_frontier_streak >= 30
-                     or self.coverage >= SLAM_COVERAGE_THRESHOLD)
-                and not self.mapping_complete):
+        # Coverage fallback is allowed only in simulation.
+        # Real unknown mapping finishes when frontiers are exhausted.
+        coverage_fallback = (
+            self._gt_free_fn is not None
+            and self.coverage >= SLAM_COVERAGE_THRESHOLD
+        )
+
+        if (
+            not _warmup
+            and (
+                self._no_frontier_streak >= 30
+                or coverage_fallback
+            )
+            and not self.mapping_complete
+        ):
             self.mapping_complete = True
             self.save_map()
             elapsed = time.time() - self.start_time
