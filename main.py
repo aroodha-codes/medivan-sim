@@ -897,68 +897,32 @@ def main() -> None:
                     if HARDWARE_MODE:
 
                         print("[main] REAL MAP EXPLORATION COMPLETE")
-
-
-
                         slam.save_map()
-
-
-
                         motor.emergency_stop()
-
-
-
                         print("[main] Robot stopped.")
-
                         print("[main] Map saved to output/slam_map.png")
-
-
-
                         running = False
 
+                    else:
 
+                        print("[main] SLAM complete! Phase 2: NAVIGATION")
+                        sim_mode = SimMode.NAVIGATION
+                        pygame.display.set_caption("MediVan -- AI Navigation")
 
-                else:
+                        map_loader.load_map(map_path)
 
-                    print("[main] SLAM complete! Phase 2: NAVIGATION")
+                        planner.plan_path(
+                            start=(int(vehicle_state.x), int(vehicle_state.y)),
+                            goal=goal,
+                            get_cost_fn=map_loader.get_cost,
+                            is_free_fn=map_loader.is_free,
+                            is_near_wall_fn=map_loader.is_near_wall,
+                            map_width=map_loader.width,
+                            map_height=map_loader.height,
+                        )
 
-
-
-                    sim_mode = SimMode.NAVIGATION
-
-                    pygame.display.set_caption("MediVan -- AI Navigation")
-
-
-
-                    map_loader.load_map(map_path)
-
-
-
-                    planner.plan_path(
-
-                        start=(int(vehicle_state.x), int(vehicle_state.y)),
-
-                        goal=goal,
-
-                        get_cost_fn=map_loader.get_cost,
-
-                        is_free_fn=map_loader.is_free,
-
-                        is_near_wall_fn=map_loader.is_near_wall,
-
-                        map_width=map_loader.width,
-
-                        map_height=map_loader.height,
-
-                    )
-
-
-
-                    print(f"[main] First path: {len(planner.path)} waypoints")
-
-
-
-                    slam = None
+                        print(f"[main] First path: {len(planner.path)} waypoints")
+                        slam = None
 
             except Exception as e:
 
