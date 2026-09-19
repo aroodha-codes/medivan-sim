@@ -38,6 +38,7 @@ from config import (
     VehicleState, IMUData, MotorCommand, BumpState,
     ObstacleAction, VibrationLevel,
     WINDOWS_REAL_CAMERA, WINDOWS_CAMERA_INDEX, FRAME_W, FRAME_H,
+    MAP_WIDTH, MAP_HEIGHT,
 )
 from modules.map_loader import MapLoader
 from modules.perception_source import CameraPerceptionSource
@@ -253,12 +254,22 @@ def main() -> None:
     logger = DataLogger(log_dir=PROJECT_ROOT)
     delivery = DeliveryQueue()
 
-    # -- Initial state ───────────────────────────
+  # -- Initial state ───────────────────────────
+if HARDWARE_MODE:
+    # Real unknown environment: start at centre of empty map.
+    start_pos = (MAP_WIDTH // 2, MAP_HEIGHT // 2)
+    start_theta = 0.0
+else:
+    # Simulation keeps the predefined hospital-map start.
     start_pos = map_loader.start_position or (125, 465)
-    localizer.initialize(start_pos, start_theta=-math.pi / 2)
-    motor.set_position(start_pos[0], start_pos[1], -math.pi / 2)
-    slam.initialize(start_pos[0], start_pos[1], -math.pi / 2)
+    start_theta = -math.pi / 2
 
+localizer.initialize(start_pos, start_theta=start_theta)
+motor.set_position(start_pos[0], start_pos[1], start_theta)
+slam.initialize(start_pos[0], start_pos[1], start_theta)
+
+if HARDWARE_MODE:
+    imu.snap_yaw(start_theta)
     # Navigation goal (used after SLAM completes)
     goal = map_loader.dock_position or (700, 295)
 
@@ -381,6 +392,19 @@ def main() -> None:
                 curr_gray=curr_gray,
                 is_free_fn=map_loader.is_free,
                 junctions=map_loader.junctions,
+            )vehicle_state = localizer.update(
+                enc_dx=enc_reading.dx_px,
+                enc_dy=enc_reading.dy_px,
+                enc_dtheta=enc_reading.dtheta,
+                prev_gray=prev_gray,
+                curr_gray=curr_gray,
+
+                # Never use hospital_map.png as ground truth on real hardware.
+                is_free_fn=None if HARDWARE_MODE else map_loader.is_free,
+                junctions=None if HARDWARE_MODE else map_loader.junctions,
+
+                # Real MPU6050 heading measurement.
+                imu_yaw=imu_data.yaw if HARDWARE_MODE else None,
             )
         except Exception:
             vehicle_state = VehicleState(x=motor.x, y=motor.y, theta=motor.theta)
