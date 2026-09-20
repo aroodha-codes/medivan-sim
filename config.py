@@ -73,8 +73,8 @@ WINDOWS_CAMERA_INDEX: int = 0
 PIN_MOTOR_ENA: int = 12                     # Left PWM  -> hardware PWM0
 PIN_MOTOR_IN1: int = 5                     # Left Dir A
 PIN_MOTOR_IN2: int = 6                     # Left Dir B
-PIN_MOTOR_IN3: int = 19                   # Right Dir A
-PIN_MOTOR_IN4: int = 13                     # Right Dir B
+PIN_MOTOR_IN3: int = 13                   # Right Dir A
+PIN_MOTOR_IN4: int = 19                     # Right Dir B
 PIN_MOTOR_ENB: int = 18                     # Right PWM -> hardware PWM1
 
 # I2C (IMU / ADC)

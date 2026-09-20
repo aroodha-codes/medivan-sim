@@ -891,6 +891,14 @@ def main() -> None:
                     scan=real_scan,
 
                 )
+                if frame_count % 30 == 0:
+                    print(
+                        f"[SLAM DEBUG] "
+                        f"x={motor.x:.1f} y={motor.y:.1f} "
+                        f"theta={math.degrees(motor.theta):.1f}deg "
+                        f"mapping_complete={slam.mapping_complete} "
+                        f"scan={'YES' if real_scan is not None else 'NO'}"
+                    )
 
                 if slam.mapping_complete:
 
