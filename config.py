@@ -70,12 +70,12 @@ WINDOWS_CAMERA_INDEX: int = 0
 #    silently fell back to software PWM (jittery, CPU-bound).
 #    GPIO18 = PWM0 and GPIO19 = PWM1 are a valid independent pair, and this
 #    map now matches Figure 5.2 of the project report exactly.
-PIN_MOTOR_ENA: int = 12                     # Left PWM  -> hardware PWM0
-PIN_MOTOR_IN1: int = 5                     # Left Dir A
-PIN_MOTOR_IN2: int = 6                     # Left Dir B
-PIN_MOTOR_IN3: int = 13                   # Right Dir A
-PIN_MOTOR_IN4: int = 19                     # Right Dir B
-PIN_MOTOR_ENB: int = 18                     # Right PWM -> hardware PWM1
+PIN_MOTOR_ENA: int = 18                     # Left PWM  -> hardware PWM0
+PIN_MOTOR_IN1: int = 19                    # Left Dir A
+PIN_MOTOR_IN2: int = 13                    # Left Dir B
+PIN_MOTOR_IN3: int = 5                   # Right Dir A
+PIN_MOTOR_IN4: int = 6                     # Right Dir B
+PIN_MOTOR_ENB: int = 12                     # Right PWM -> hardware PWM1
 
 # I2C (IMU / ADC)
 PIN_I2C_SDA: int = 2
