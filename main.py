@@ -1059,6 +1059,14 @@ def main() -> None:
                     None if HARDWARE_MODE else map_loader.is_free,
 
                 )
+                if frame_count % 30 == 0:
+                    print(
+                        f"[EXPLORE DEBUG] "
+                        f"left_pwm={motor_cmd.left_pwm} "
+                        f"right_pwm={motor_cmd.right_pwm} "
+                        f"left_dir={motor_cmd.left_dir} "
+                        f"right_dir={motor_cmd.right_dir}"
+                    )
 
             elif motor.mode == DriveMode.AUTONOMOUS and not motor.emergency_stopped:
 
