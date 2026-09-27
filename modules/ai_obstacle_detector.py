@@ -1,435 +1,1401 @@
 """
-ai_obstacle_detector.py -- Indoor hospital obstacle detection using YOLOv8-Nano.
+ai_obstacle_detector.py
 
-Detects and classifies obstacles specific to indoor hospital environments:
-  - PERSON:           staff, patients, visitors
-  - CART:             wheelchairs, trolleys, wheeled carts
-  - FURNITURE:        chairs, couches, benches, tables
-  - MEDICAL_EQUIPMENT: hospital beds, gurneys, IV stands
-  - EQUIPMENT:        bags, monitors, portable devices
+AI-based obstacle detection for MediVan.
 
-Only indoor-relevant COCO classes are kept; all outdoor detections
-(cars, trucks, animals, sports equipment, etc.) are filtered out.
+Features:
+- YOLOv8 ONNX object detection
+- OpenCV MOG2 fallback when YOLO is unavailable
+- Filters irrelevant/static objects
+- Only considers objects inside the driving corridor
+- Uses confidence + proximity thresholds
+- Temporal confirmation to reduce false STOP events
+- Produces ObstacleResult objects compatible with the planner/main.py
 
-Operates in dual mode:
-  - YOLO:      loads YOLOv8n ONNX model via OpenCV DNN (320x320 input)
-  - HEURISTIC: fallback classifier from MOG2 contours when no model present
-
-RPi4 optimizations:
-  - 320x320 input (4x fewer pixels than 640x640)
-  - Skip-frame inference (every 5th frame, reuse last result)
-  - Aggressive NMS (0.45) and confidence threshold (0.35)
-  - Pre-allocated numpy buffers (zero per-frame allocation)
-  - Indoor-only class filter (17 classes from 80 COCO classes)
+Designed for Raspberry Pi 4.
 """
 
 from __future__ import annotations
 
-import math
 import os
-import sys
-from typing import Dict, List, Optional, Tuple
+import time
+from collections import defaultdict, deque
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-if __name__ == "__main__":
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+try:
+    import config as c
+except Exception:
+    c = None
 
-from config import (
-    FRAME_W, FRAME_H,
-    OBS_ROI_TOP, OBS_ROI_BOTTOM,
-    OBS_MIN_AREA_PX, OBS_SLOW_AREA_PX, OBS_STOP_AREA_PX,
-    YOLO_MODEL_PATH, YOLO_INPUT_SIZE,
-    YOLO_CONF_THRESHOLD, YOLO_NMS_THRESHOLD,
-    YOLO_SKIP_FRAMES, YOLO_CLASSES_OF_INTEREST,
-    ObstacleAction, ObstacleClass, ObstacleResult,
-)
+try:
+    from config import (
+        ObstacleAction,
+        ObstacleClass,
+        ObstacleResult,
+    )
+except Exception:
+    # Fallback definitions so the module can still be imported for testing.
+    from enum import Enum
 
-# COCO class ID -> Indoor ObstacleClass mapping
-# Only maps classes relevant to hospital corridor navigation
-_CLASS_MAP: Dict[int, ObstacleClass] = {
-    # ── People (dynamic, highest priority) ───────
-    0:  ObstacleClass.PERSON,           # person (staff, patient, visitor)
-    # ── Wheeled objects (carts, wheelchairs) ─────
-    1:  ObstacleClass.CART,             # bicycle -> wheelchair/cart proxy
-    # ── Furniture (static indoor obstacles) ──────
-    56: ObstacleClass.FURNITURE,        # chair
-    57: ObstacleClass.FURNITURE,        # couch / waiting area seating
-    60: ObstacleClass.FURNITURE,        # dining table -> desk / nurses station
-    13: ObstacleClass.FURNITURE,        # bench
-    58: ObstacleClass.FURNITURE,        # potted plant (hallway decoration)
-    # ── Medical equipment (hospital-specific) ────
-    59: ObstacleClass.MEDICAL_EQUIPMENT,  # bed -> hospital bed / gurney
-    39: ObstacleClass.MEDICAL_EQUIPMENT,  # bottle -> IV fluid container
-    # ── Portable equipment ───────────────────────
-    24: ObstacleClass.EQUIPMENT,        # backpack -> bags / carried items
-    26: ObstacleClass.EQUIPMENT,        # handbag -> staff bags
-    28: ObstacleClass.EQUIPMENT,        # suitcase -> rolling equipment case
-    63: ObstacleClass.EQUIPMENT,        # laptop -> mobile workstation
-    62: ObstacleClass.EQUIPMENT,        # tv -> corridor display / monitor
-    73: ObstacleClass.EQUIPMENT,        # book -> charts / clipboard
-    74: ObstacleClass.EQUIPMENT,        # clock (static, landmark)
-    67: ObstacleClass.EQUIPMENT,        # cell phone (small, usually ignored)
+    class ObstacleAction(Enum):
+        NOMINAL = 0
+        SLOW = 1
+        STOP = 2
+
+    class ObstacleClass(Enum):
+        UNKNOWN = 0
+        PERSON = 1
+        CART = 2
+        FURNITURE = 3
+        MEDICAL_EQUIPMENT = 4
+        EQUIPMENT = 5
+
+    class ObstacleResult:
+        def __init__(
+            self,
+            cls,
+            confidence,
+            bbox,
+            proximity,
+            action,
+        ):
+            self.cls = cls
+            self.confidence = confidence
+            self.bbox = bbox
+            self.proximity = proximity
+            self.action = action
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+# YOLO model location.
+DEFAULT_MODEL_PATHS = [
+    "models/yolov8n.onnx",
+    "yolov8n.onnx",
+    "models/yolo/yolov8n.onnx",
+]
+
+# YOLO input resolution.
+YOLO_INPUT_SIZE = 320
+
+# Minimum confidence for accepting a detection.
+MIN_CONFIDENCE = 0.45
+
+# Strong confidence needed for safety decisions.
+SAFETY_CONFIDENCE = 0.65
+
+# NMS threshold.
+NMS_THRESHOLD = 0.45
+
+# Camera driving corridor.
+#
+# Objects outside this horizontal region are normally ignored
+# for navigation purposes.
+CORRIDOR_LEFT = 0.30
+CORRIDOR_RIGHT = 0.70
+
+# Slightly wider corridor for very large objects.
+WIDE_CORRIDOR_LEFT = 0.20
+WIDE_CORRIDOR_RIGHT = 0.80
+
+# Proximity thresholds.
+#
+# proximity is approximately:
+# bottom of bounding box / image height
+#
+# Higher value = object appears closer.
+SLOW_PROXIMITY = 0.48
+STOP_PROXIMITY = 0.68
+
+# Bounding-box area thresholds.
+MIN_OBJECT_AREA = 0.003
+STOP_AREA_RATIO = 0.16
+SLOW_AREA_RATIO = 0.05
+
+# Temporal confirmation.
+#
+# A single bad YOLO frame will not immediately generate STOP.
+REQUIRED_STOP_CONFIRMATIONS = 2
+
+# Number of previous frames kept for tracking.
+HISTORY_LENGTH = 5
+
+# Maximum number of detections.
+MAX_DETECTIONS = 20
+
+
+# ============================================================
+# COCO CLASS NAMES
+# ============================================================
+
+COCO_CLASSES = [
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
+]
+
+
+# ============================================================
+# COCO -> PROJECT CLASS MAPPING
+# ============================================================
+
+def _get_project_class(name: str):
+    """
+    Convert a YOLO/COCO class into the project's ObstacleClass.
+    """
+
+    name = name.lower().strip()
+
+    if name == "person":
+        return ObstacleClass.PERSON
+
+    # Bicycle/cart-like mobile objects.
+    if name in {
+        "bicycle",
+        "suitcase",
+    }:
+        return ObstacleClass.CART
+
+    # Medical/environmental objects that may physically block the robot.
+    if name in {
+        "bed",
+        "bottle",
+    }:
+        return ObstacleClass.MEDICAL_EQUIPMENT
+
+    # Static furniture.
+    if name in {
+        "chair",
+        "couch",
+        "bench",
+        "dining table",
+        "potted plant",
+    }:
+        return ObstacleClass.FURNITURE
+
+    # Other equipment.
+    if name in {
+        "backpack",
+        "handbag",
+        "laptop",
+        "tv",
+        "book",
+        "clock",
+        "cell phone",
+        "remote",
+        "keyboard",
+    }:
+        return ObstacleClass.EQUIPMENT
+
+    return ObstacleClass.UNKNOWN
+
+
+# Classes that should be allowed to influence navigation.
+NAVIGATION_CLASSES = {
+    ObstacleClass.PERSON,
+    ObstacleClass.CART,
+    ObstacleClass.MEDICAL_EQUIPMENT,
 }
 
 
+# Classes that are normally static/non-blocking.
+STATIC_CLASSES = {
+    ObstacleClass.FURNITURE,
+    ObstacleClass.EQUIPMENT,
+}
+
+
+# ============================================================
+# AI OBSTACLE DETECTOR
+# ============================================================
+
 class AIObstacleDetector:
-    """YOLOv8-Nano obstacle detector with RPi4-optimized inference.
+    """
+    Main obstacle detector.
 
-    When an ONNX model file is available at YOLO_MODEL_PATH, full
-    deep-learning inference is used via OpenCV DNN.  Otherwise, a
-    lightweight heuristic classifier assigns categories to MOG2
-    detections based on size and aspect ratio.
+    Usage:
 
-    Skip-frame logic reuses the last detection result for N-1 out
-    of every N frames, drastically reducing CPU load on RPi4.
+        detector = AIObstacleDetector()
+
+        obstacles = detector.detect(frame)
+
+        for obstacle in obstacles:
+            print(obstacle.cls)
+            print(obstacle.action)
+
+        detector.close()
     """
 
-    def __init__(self) -> None:
-        self._net: Optional[cv2.dnn.Net] = None
-        self._use_yolo: bool = False
-        self._input_size: int = YOLO_INPUT_SIZE
-        self._frame_count: int = 0
-        self._cached_results: List[ObstacleResult] = []
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        use_heuristic_fallback: bool = True,
+    ):
 
-        # MOG2 fallback
-        self._bg_sub = cv2.createBackgroundSubtractorMOG2(
-            history=120, varThreshold=40, detectShadows=False,
-        )
-        self._kern_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        self._kern_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        self.model_path = model_path
+        self.use_heuristic_fallback = use_heuristic_fallback
 
-        # Pre-allocated input blob buffer (320x320x3)
-        self._blob_buffer = np.zeros(
-            (1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE), dtype=np.float32
-        )
+        self.net = None
+        self.model_loaded = False
+        self.using_heuristic = False
 
-        # Try to load ONNX model
-        self._try_load_model()
+        # Detection history.
+        self.history = deque(maxlen=HISTORY_LENGTH)
 
-    @property
-    def mode(self) -> str:
-        """Return current detection mode: 'YOLO' or 'HEURISTIC'."""
-        return "YOLO" if self._use_yolo else "HEURISTIC"
+        # Confirmation counters.
+        self.confirmation_counter = defaultdict(int)
 
-    # -- public API -----------------------------------------
+        # Previous detection positions.
+        self.previous_objects = []
 
-    def detect(self, frame: np.ndarray) -> List[ObstacleResult]:
-        """Run obstacle detection on a BGR camera frame.
+        # Statistics.
+        self.frame_count = 0
+        self.last_detection_time = 0.0
 
-        Uses skip-frame logic: full inference only every YOLO_SKIP_FRAMES
-        frames, returns cached results for intermediate frames.
+        # MOG2 fallback.
+        self.bg_subtractor = None
 
-        Parameters
-        ----------
-        frame : np.ndarray
-            BGR image (640x480).
+        # Load YOLO.
+        self._load_model()
 
-        Returns
-        -------
-        List[ObstacleResult]
-            Detected obstacles with classification and confidence.
+    # ========================================================
+    # MODEL LOADING
+    # ========================================================
+
+    def _find_model(self) -> Optional[str]:
         """
-        self._frame_count += 1
-
-        # Skip-frame: reuse cached results for non-inference frames
-        if self._frame_count % YOLO_SKIP_FRAMES != 1 and self._cached_results:
-            return self._cached_results
-
-        if self._use_yolo:
-            # FIX (MT3608 review): a single inference fault used to propagate
-            # straight out of detect() and terminate the 30 FPS control loop.
-            # Perception now degrades to the heuristic classifier instead of
-            # stopping the vehicle's brain mid-corridor.
-            try:
-                results = self._detect_yolo(frame)
-            except Exception as e:
-                print(f"[AIDetector] YOLO inference failed ({e}); "
-                      f"falling back to heuristic classifier.")
-                self._use_yolo = False
-                results = self._detect_heuristic(frame)
-        else:
-            results = self._detect_heuristic(frame)
-
-        self._cached_results = results
-        return results
-
-    # -- YOLO inference -------------------------------------
-
-    def _try_load_model(self) -> None:
-        """Attempt to load the YOLOv8n ONNX model."""
-        # Try both relative to project root and current dir
-        paths_to_try = [
-            os.path.join(os.path.dirname(__file__), "..", YOLO_MODEL_PATH),
-            YOLO_MODEL_PATH,
-        ]
-        for path in paths_to_try:
-            if os.path.exists(path):
-                try:
-                    self._net = cv2.dnn.readNetFromONNX(path)
-                    # Prefer CPU backend (RPi4 has no GPU)
-                    self._net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                    self._net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-
-                    # FIX (MT3608 review): YOLOv8 ONNX exports carry a FIXED
-                    # input shape. If config.YOLO_INPUT_SIZE disagrees with it,
-                    # forward() throws a Reshape assertion on the first frame.
-                    # Probe the model once and adopt its real size.
-                    self._input_size = self._probe_input_size(path)
-                    if self._input_size != YOLO_INPUT_SIZE:
-                        print(f"[AIDetector] NOTE: model expects "
-                              f"{self._input_size}x{self._input_size}, config "
-                              f"says {YOLO_INPUT_SIZE}. Using the model's size.")
-
-                    self._use_yolo = True
-                    print(f"[AIDetector] YOLOv8n loaded from {path} "
-                          f"@ {self._input_size}x{self._input_size}")
-                    return
-                except Exception as e:
-                    print(f"[AIDetector] Failed to load ONNX: {e}")
-                    break
-
-        print("[AIDetector] No ONNX model found -- using heuristic classifier")
-
-    def _probe_input_size(self, path: str) -> int:
-        """Determine the ONNX model's expected square input size.
-
-        Tries the graph metadata first, then falls back to trial inference
-        over the common YOLOv8 export sizes.
+        Find YOLO ONNX model.
         """
-        try:
-            import onnxruntime as ort
-            so = ort.SessionOptions()
-            so.log_severity_level = 3
-            sess = ort.InferenceSession(
-                path, so, providers=["CPUExecutionProvider"])
-            shape = sess.get_inputs()[0].shape
-            if isinstance(shape[-1], int) and shape[-1] > 0:
-                return int(shape[-1])
-        except Exception:
-            pass
 
-        # Fallback: probe candidate sizes with a dummy forward pass.
-        for size in (YOLO_INPUT_SIZE, 320, 640, 160, 256, 416):
-            try:
-                dummy = np.zeros((size, size, 3), dtype=np.uint8)
-                blob = cv2.dnn.blobFromImage(
-                    dummy, 1.0 / 255.0, (size, size), swapRB=True, crop=False)
-                self._net.setInput(blob)
-                self._net.forward()
-                return size
-            except Exception:
+        paths = []
+
+        if self.model_path:
+            paths.append(self.model_path)
+
+        paths.extend(DEFAULT_MODEL_PATHS)
+
+        for path in paths:
+
+            if not path:
                 continue
-        return YOLO_INPUT_SIZE
 
-    def _detect_yolo(self, frame: np.ndarray) -> List[ObstacleResult]:
-        """Run YOLOv8n inference via OpenCV DNN."""
-        assert self._net is not None
+            if os.path.isfile(path):
+                return path
 
-        # 1. Preprocess: letterbox resize + normalize
-        size = getattr(self, "_input_size", YOLO_INPUT_SIZE)
+        return None
+
+    def _load_model(self) -> None:
+        """
+        Load YOLO ONNX model.
+        """
+
+        model_path = self._find_model()
+
+        if model_path is None:
+
+            print(
+                "[AI] YOLO model not found. "
+                "Using OpenCV heuristic detector."
+            )
+
+            self._init_heuristic()
+            return
+
+        try:
+
+            print(f"[AI] Loading YOLO model: {model_path}")
+
+            self.net = cv2.dnn.readNetFromONNX(model_path)
+
+            # Raspberry Pi CPU.
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+            self.model_loaded = True
+            self.using_heuristic = False
+
+            print("[AI] YOLO model loaded successfully.")
+
+        except Exception as e:
+
+            print(f"[AI] Failed to load YOLO model: {e}")
+
+            self.net = None
+            self.model_loaded = False
+
+            if self.use_heuristic_fallback:
+                self._init_heuristic()
+
+    # ========================================================
+    # HEURISTIC FALLBACK
+    # ========================================================
+
+    def _init_heuristic(self) -> None:
+        """
+        Initialize OpenCV motion detector.
+        """
+
+        try:
+
+            self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=300,
+                varThreshold=32,
+                detectShadows=False,
+            )
+
+            self.using_heuristic = True
+
+            print("[AI] Heuristic motion detector enabled.")
+
+        except Exception as e:
+
+            print(f"[AI] Failed to initialize heuristic detector: {e}")
+
+            self.bg_subtractor = None
+            self.using_heuristic = False
+
+    # ========================================================
+    # IMAGE PREPROCESSING
+    # ========================================================
+
+    def _preprocess(
+        self,
+        frame: np.ndarray,
+    ) -> Tuple[np.ndarray, float, float]:
+
+        h, w = frame.shape[:2]
+
         blob = cv2.dnn.blobFromImage(
-            frame, scalefactor=1.0 / 255.0,
-            size=(size, size),
-            swapRB=True, crop=False,
+            frame,
+            scalefactor=1.0 / 255.0,
+            size=(YOLO_INPUT_SIZE, YOLO_INPUT_SIZE),
+            swapRB=True,
+            crop=False,
         )
 
-        # 2. Forward pass
-        self._net.setInput(blob)
-        outputs = self._net.forward()
+        scale_x = w / float(YOLO_INPUT_SIZE)
+        scale_y = h / float(YOLO_INPUT_SIZE)
 
-        # 3. Postprocess
-        return self._postprocess_yolo(outputs, frame.shape)
+        return blob, scale_x, scale_y
 
-    def _postprocess_yolo(
-        self, outputs: np.ndarray, frame_shape: Tuple[int, ...]
-    ) -> List[ObstacleResult]:
-        """Parse YOLOv8 output tensor into ObstacleResult list.
+    # ========================================================
+    # YOLO DETECTION
+    # ========================================================
 
-        YOLOv8 output shape: (1, 84, N) where 84 = 4 bbox + 80 classes
-        Transposed to (N, 84) for processing.
-        """
-        h, w = frame_shape[:2]
-        size = getattr(self, "_input_size", YOLO_INPUT_SIZE)
-        scale_x = w / size
-        scale_y = h / size
+    def _run_yolo(
+        self,
+        frame: np.ndarray,
+    ) -> List[Tuple[int, float, Tuple[int, int, int, int]]]:
 
-        # Handle different output shapes
-        if len(outputs.shape) == 3:
-            preds = outputs[0].T  # (N, 84)
-        else:
-            preds = outputs
-
-        if preds.shape[1] < 5:
+        if self.net is None:
             return []
 
-        boxes: List[List[int]] = []
-        confidences: List[float] = []
-        class_ids: List[int] = []
+        blob, scale_x, scale_y = self._preprocess(frame)
 
-        for detection in preds:
-            # bbox: cx, cy, w, h
-            cx, cy, bw, bh = detection[:4]
-            class_scores = detection[4:]
+        try:
 
-            max_score = float(np.max(class_scores))
+            self.net.setInput(blob)
+
+            outputs = self.net.forward()
+
+        except Exception as e:
+
+            print(f"[AI] YOLO inference error: {e}")
+            return []
+
+        # ----------------------------------------------------
+        # Normalize output shape.
+        #
+        # Typical YOLOv8 ONNX:
+        # (1, 84, 8400)
+        #
+        # We convert it to:
+        # (8400, 84)
+        # ----------------------------------------------------
+
+        output = np.squeeze(outputs)
+
+        if output.ndim != 2:
+            print(f"[AI] Unexpected YOLO output shape: {outputs.shape}")
+            return []
+
+        if output.shape[0] < output.shape[1]:
+            output = output.T
+
+        detections = []
+
+        boxes = []
+        confidences = []
+        class_ids = []
+
+        h, w = frame.shape[:2]
+
+        for row in output:
+
+            if len(row) < 6:
+                continue
+
+            cx = float(row[0])
+            cy = float(row[1])
+            bw = float(row[2])
+            bh = float(row[3])
+
+            class_scores = row[4:]
+
+            if len(class_scores) == 0:
+                continue
+
             class_id = int(np.argmax(class_scores))
+            confidence = float(class_scores[class_id])
 
-            if max_score < YOLO_CONF_THRESHOLD:
+            if confidence < MIN_CONFIDENCE:
                 continue
 
-            # Only keep classes of interest
-            if class_id not in YOLO_CLASSES_OF_INTEREST:
+            if class_id >= len(COCO_CLASSES):
                 continue
 
-            # Convert to pixel coordinates
-            x1 = int((cx - bw / 2) * scale_x)
-            y1 = int((cy - bh / 2) * scale_y)
-            bw_px = int(bw * scale_x)
-            bh_px = int(bh * scale_y)
+            # YOLO coordinates are based on model input size.
+            x_center = cx * scale_x
+            y_center = cy * scale_y
+            box_width = bw * scale_x
+            box_height = bh * scale_y
 
-            boxes.append([x1, y1, bw_px, bh_px])
-            confidences.append(max_score)
+            x = int(x_center - box_width / 2)
+            y = int(y_center - box_height / 2)
+
+            box_width = int(box_width)
+            box_height = int(box_height)
+
+            x = max(0, min(x, w - 1))
+            y = max(0, min(y, h - 1))
+
+            box_width = max(
+                1,
+                min(box_width, w - x),
+            )
+
+            box_height = max(
+                1,
+                min(box_height, h - y),
+            )
+
+            boxes.append(
+                [
+                    x,
+                    y,
+                    box_width,
+                    box_height,
+                ]
+            )
+
+            confidences.append(confidence)
             class_ids.append(class_id)
 
         if not boxes:
             return []
 
-        # NMS
-        indices = cv2.dnn.NMSBoxes(
-            boxes, confidences, YOLO_CONF_THRESHOLD, YOLO_NMS_THRESHOLD
-        )
+        # NMS.
+        try:
 
-        results: List[ObstacleResult] = []
-        if len(indices) > 0:
-            for i in indices.flatten():
-                x, y, bw_px, bh_px = boxes[i]
-                area = bw_px * bh_px
-                bottom_y = y + bh_px
-                proximity = bottom_y / h
+            indices = cv2.dnn.NMSBoxes(
+                boxes,
+                confidences,
+                MIN_CONFIDENCE,
+                NMS_THRESHOLD,
+            )
 
-                # Action based on area
-                if area >= OBS_STOP_AREA_PX:
-                    action = ObstacleAction.STOP
-                elif area >= OBS_SLOW_AREA_PX:
-                    action = ObstacleAction.SLOW
-                else:
-                    action = ObstacleAction.NOMINAL
+        except Exception as e:
 
-                classification = _CLASS_MAP.get(
-                    class_ids[i], ObstacleClass.UNKNOWN
+            print(f"[AI] NMS error: {e}")
+            return []
+
+        if len(indices) == 0:
+            return []
+
+        indices = np.array(indices).reshape(-1)
+
+        for i in indices:
+
+            i = int(i)
+
+            detections.append(
+                (
+                    class_ids[i],
+                    confidences[i],
+                    tuple(boxes[i]),
                 )
+            )
 
-                results.append(ObstacleResult(
-                    bbox=(x, y, bw_px, bh_px),
-                    area=area,
-                    proximity=proximity,
-                    action=action,
-                    classification=classification,
-                    confidence=confidences[i],
-                ))
+            if len(detections) >= MAX_DETECTIONS:
+                break
 
-        return results
+        return detections
 
-    # -- Heuristic fallback ---------------------------------
+    # ========================================================
+    # GEOMETRY
+    # ========================================================
 
-    def _detect_heuristic(self, frame: np.ndarray) -> List[ObstacleResult]:
-        """MOG2 background subtraction + indoor-specific classifier.
+    def _bbox_center(
+        self,
+        bbox: Tuple[int, int, int, int],
+    ) -> Tuple[float, float]:
 
-        Classifies detected blobs for indoor hospital environment:
-          - Tall + narrow (aspect > 1.5)       -> PERSON (standing staff/patient)
-          - Wide + short (aspect < 0.6)        -> CART (wheelchair/trolley)
-          - Large + medium aspect (area > 8000) -> MEDICAL_EQUIPMENT (bed/gurney)
-          - Medium + square-ish               -> FURNITURE (chair/table)
-          - Otherwise                          -> EQUIPMENT (bags/devices)
-        """
-        roi_top = int(FRAME_H * OBS_ROI_TOP)
-        roi_bot = int(FRAME_H * OBS_ROI_BOTTOM)
-        roi = frame[roi_top:roi_bot, :]
+        x, y, w, h = bbox
 
-        mask = self._bg_sub.apply(roi, learningRate=0.005)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kern_close)
-        mask = cv2.dilate(mask, self._kern_dilate, iterations=1)
-
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        return (
+            x + w / 2.0,
+            y + h / 2.0,
         )
 
-        results: List[ObstacleResult] = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = w * h
-            if area < OBS_MIN_AREA_PX:
+    def _bbox_area_ratio(
+        self,
+        bbox: Tuple[int, int, int, int],
+        frame_shape,
+    ) -> float:
+
+        _, _, bw, bh = bbox
+
+        frame_h, frame_w = frame_shape[:2]
+
+        if frame_w <= 0 or frame_h <= 0:
+            return 0.0
+
+        return (
+            float(bw * bh)
+            / float(frame_w * frame_h)
+        )
+
+    def _proximity(
+        self,
+        bbox: Tuple[int, int, int, int],
+        frame_shape,
+    ) -> float:
+
+        frame_h, frame_w = frame_shape[:2]
+
+        if frame_h <= 0:
+            return 0.0
+
+        x, y, w, h = bbox
+
+        bottom_y = y + h
+
+        proximity = bottom_y / float(frame_h)
+
+        return max(
+            0.0,
+            min(1.0, proximity),
+        )
+
+    # ========================================================
+    # DRIVING CORRIDOR
+    # ========================================================
+
+    def _is_in_driving_corridor(
+        self,
+        bbox: Tuple[int, int, int, int],
+        frame_shape,
+    ) -> bool:
+        """
+        Determine whether an object is actually in front
+        of the MediVan.
+
+        Objects at the extreme left/right of the image are
+        ignored for navigation.
+        """
+
+        frame_h, frame_w = frame_shape[:2]
+
+        if frame_w <= 0:
+            return False
+
+        x, y, w, h = bbox
+
+        center_x = x + w / 2.0
+
+        normalized_x = center_x / float(frame_w)
+
+        # Normal driving corridor.
+        if CORRIDOR_LEFT <= normalized_x <= CORRIDOR_RIGHT:
+            return True
+
+        # Large object can extend into the path.
+        object_left = x / float(frame_w)
+        object_right = (x + w) / float(frame_w)
+
+        overlaps_center = (
+            object_left <= 0.50 <= object_right
+        )
+
+        if overlaps_center:
+
+            # Only allow this if the object is reasonably large.
+            area_ratio = self._bbox_area_ratio(
+                bbox,
+                frame_shape,
+            )
+
+            if area_ratio >= SLOW_AREA_RATIO:
+                return True
+
+        # Wider corridor only for very large objects.
+        if area_ratio if "area_ratio" in locals() else False:
+            pass
+
+        return False
+
+    # ========================================================
+    # OBJECT RELEVANCE
+    # ========================================================
+
+    def _is_relevant_class(
+        self,
+        obstacle_class,
+    ) -> bool:
+
+        return obstacle_class in NAVIGATION_CLASSES
+
+    # ========================================================
+    # ACTION CALCULATION
+    # ========================================================
+
+    def _calculate_action(
+        self,
+        obstacle_class,
+        confidence: float,
+        bbox: Tuple[int, int, int, int],
+        proximity: float,
+        frame_shape,
+    ):
+        """
+        Decide NOMINAL / SLOW / STOP.
+        """
+
+        # ----------------------------------------------------
+        # Static objects never generate a navigation STOP.
+        # ----------------------------------------------------
+
+        if obstacle_class in STATIC_CLASSES:
+            return ObstacleAction.NOMINAL
+
+        # Unknown objects are ignored for safety decisions.
+        if obstacle_class == ObstacleClass.UNKNOWN:
+            return ObstacleAction.NOMINAL
+
+        # Only relevant mobile/physical objects continue.
+        if obstacle_class not in NAVIGATION_CLASSES:
+            return ObstacleAction.NOMINAL
+
+        # ----------------------------------------------------
+        # Confidence gate.
+        # ----------------------------------------------------
+
+        if confidence < MIN_CONFIDENCE:
+            return ObstacleAction.NOMINAL
+
+        # ----------------------------------------------------
+        # Driving corridor gate.
+        # ----------------------------------------------------
+
+        if not self._is_in_driving_corridor(
+            bbox,
+            frame_shape,
+        ):
+            return ObstacleAction.NOMINAL
+
+        # ----------------------------------------------------
+        # Size.
+        # ----------------------------------------------------
+
+        area_ratio = self._bbox_area_ratio(
+            bbox,
+            frame_shape,
+        )
+
+        # Very tiny object.
+        if area_ratio < MIN_OBJECT_AREA:
+            return ObstacleAction.NOMINAL
+
+        # ----------------------------------------------------
+        # Low confidence objects should not stop robot.
+        # ----------------------------------------------------
+
+        if confidence < SAFETY_CONFIDENCE:
+
+            if proximity >= SLOW_PROXIMITY:
+                return ObstacleAction.SLOW
+
+            return ObstacleAction.NOMINAL
+
+        # ----------------------------------------------------
+        # STOP condition.
+        # ----------------------------------------------------
+
+        stop_condition = (
+            proximity >= STOP_PROXIMITY
+            or area_ratio >= STOP_AREA_RATIO
+        )
+
+        if stop_condition:
+
+            # Require temporal confirmation.
+            return ObstacleAction.STOP
+
+        # ----------------------------------------------------
+        # SLOW condition.
+        # ----------------------------------------------------
+
+        slow_condition = (
+            proximity >= SLOW_PROXIMITY
+            or area_ratio >= SLOW_AREA_RATIO
+        )
+
+        if slow_condition:
+            return ObstacleAction.SLOW
+
+        return ObstacleAction.NOMINAL
+
+    # ========================================================
+    # TEMPORAL CONFIRMATION
+    # ========================================================
+
+    def _object_key(
+        self,
+        obstacle_class,
+        bbox,
+    ):
+
+        x, y, w, h = bbox
+
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+
+        # Quantize location.
+        gx = int(cx / 40)
+        gy = int(cy / 40)
+
+        return (
+            str(obstacle_class),
+            gx,
+            gy,
+        )
+
+    def _apply_temporal_confirmation(
+        self,
+        obstacle_class,
+        bbox,
+        action,
+    ):
+
+        key = self._object_key(
+            obstacle_class,
+            bbox,
+        )
+
+        if action == ObstacleAction.STOP:
+
+            self.confirmation_counter[key] += 1
+
+            if (
+                self.confirmation_counter[key]
+                >= REQUIRED_STOP_CONFIRMATIONS
+            ):
+                return ObstacleAction.STOP
+
+            # First frame:
+            # slow instead of immediately stopping.
+            return ObstacleAction.SLOW
+
+        # Reset nearby confirmation when object no longer
+        # qualifies for STOP.
+        self.confirmation_counter[key] = max(
+            0,
+            self.confirmation_counter[key] - 1,
+        )
+
+        return action
+
+    # ========================================================
+    # CONVERT YOLO DETECTIONS
+    # ========================================================
+
+    def _convert_detections(
+        self,
+        raw_detections,
+        frame,
+    ) -> List[ObstacleResult]:
+
+        results = []
+
+        for class_id, confidence, bbox in raw_detections:
+
+            if class_id < 0 or class_id >= len(COCO_CLASSES):
                 continue
 
-            full_y = y + roi_top
-            bottom_y = full_y + h
-            proximity = bottom_y / FRAME_H
+            name = COCO_CLASSES[class_id]
 
-            # Action
-            if area >= OBS_STOP_AREA_PX:
-                action = ObstacleAction.STOP
-            elif area >= OBS_SLOW_AREA_PX:
+            obstacle_class = _get_project_class(name)
+
+            # ------------------------------------------------
+            # Ignore classes that are not part of navigation.
+            # We completely omit them from results.
+            # ------------------------------------------------
+
+            if (
+                obstacle_class == ObstacleClass.UNKNOWN
+                or obstacle_class in STATIC_CLASSES
+            ):
+                continue
+
+            proximity = self._proximity(
+                bbox,
+                frame.shape,
+            )
+
+            action = self._calculate_action(
+                obstacle_class,
+                confidence,
+                bbox,
+                proximity,
+                frame.shape,
+            )
+
+            action = self._apply_temporal_confirmation(
+                obstacle_class,
+                bbox,
+                action,
+            )
+
+            result = ObstacleResult(
+                cls=obstacle_class,
+                confidence=float(confidence),
+                bbox=bbox,
+                proximity=float(proximity),
+                action=action,
+            )
+
+            # Attach extra information dynamically.
+            # This does not break the existing ObstacleResult.
+            try:
+                result.label = name
+                result.area_ratio = self._bbox_area_ratio(
+                    bbox,
+                    frame.shape,
+                )
+                result.in_corridor = self._is_in_driving_corridor(
+                    bbox,
+                    frame.shape,
+                )
+            except Exception:
+                pass
+
+            results.append(result)
+
+        # Sort by danger.
+        results.sort(
+            key=lambda obj: (
+                obj.action.value
+                if hasattr(obj.action, "value")
+                else 0,
+                obj.proximity,
+                obj.confidence,
+            ),
+            reverse=True,
+        )
+
+        return results[:MAX_DETECTIONS]
+
+    # ========================================================
+    # HEURISTIC MOTION DETECTION
+    # ========================================================
+
+    def _detect_heuristic(
+        self,
+        frame: np.ndarray,
+    ) -> List[ObstacleResult]:
+
+        if self.bg_subtractor is None:
+            return []
+
+        mask = self.bg_subtractor.apply(frame)
+
+        # Remove noise.
+        kernel = np.ones(
+            (5, 5),
+            np.uint8,
+        )
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            kernel,
+        )
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+        )
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        results = []
+
+        frame_h, frame_w = frame.shape[:2]
+
+        for contour in contours:
+
+            area = cv2.contourArea(contour)
+
+            if area < 800:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+
+            bbox = (
+                int(x),
+                int(y),
+                int(w),
+                int(h),
+            )
+
+            area_ratio = (
+                area
+                / float(frame_w * frame_h)
+            )
+
+            # Only motion in driving corridor.
+            if not self._is_in_driving_corridor(
+                bbox,
+                frame.shape,
+            ):
+                continue
+
+            proximity = self._proximity(
+                bbox,
+                frame.shape,
+            )
+
+            # Heuristic detector cannot know exact object class.
+            obstacle_class = ObstacleClass.PERSON
+
+            confidence = 0.60
+
+            if (
+                proximity >= STOP_PROXIMITY
+                and area_ratio >= 0.08
+            ):
+                action = ObstacleAction.SLOW
+            elif proximity >= SLOW_PROXIMITY:
                 action = ObstacleAction.SLOW
             else:
                 action = ObstacleAction.NOMINAL
 
-            # Indoor heuristic classification by aspect ratio + area
-            aspect = h / max(w, 1)
-            if aspect > 1.5:
-                # Tall, narrow → standing person
-                classification = ObstacleClass.PERSON
-                conf = 0.70 + min(0.2, area / 20000)
-            elif aspect < 0.6:
-                # Wide, flat → wheelchair / cart / trolley
-                classification = ObstacleClass.CART
-                conf = 0.60 + min(0.2, area / 25000)
-            elif area > 8000 and 0.6 <= aspect <= 1.2:
-                # Large, roughly square → hospital bed / gurney
-                classification = ObstacleClass.MEDICAL_EQUIPMENT
-                conf = 0.55 + min(0.2, area / 30000)
-            elif area > 3000:
-                # Medium → furniture (chair, table)
-                classification = ObstacleClass.FURNITURE
-                conf = 0.50 + min(0.2, area / 25000)
-            else:
-                # Small → portable equipment
-                classification = ObstacleClass.EQUIPMENT
-                conf = 0.45 + min(0.2, area / 30000)
-
-            results.append(ObstacleResult(
-                bbox=(x, full_y, w, h),
-                area=area,
+            result = ObstacleResult(
+                cls=obstacle_class,
+                confidence=confidence,
+                bbox=bbox,
                 proximity=proximity,
                 action=action,
-                classification=classification,
-                confidence=min(0.99, conf),
-            ))
+            )
 
-        return results
+            try:
+                result.label = "motion"
+                result.area_ratio = area_ratio
+                result.in_corridor = True
+            except Exception:
+                pass
+
+            results.append(result)
+
+        results.sort(
+            key=lambda obj: obj.proximity,
+            reverse=True,
+        )
+
+        return results[:MAX_DETECTIONS]
+
+    # ========================================================
+    # MAIN DETECTION FUNCTION
+    # ========================================================
+
+    def detect(
+        self,
+        frame: np.ndarray,
+    ) -> List[ObstacleResult]:
+        """
+        Detect obstacles in a camera frame.
+
+        Parameters
+        ----------
+        frame:
+            BGR OpenCV image.
+
+        Returns
+        -------
+        List[ObstacleResult]
+        """
+
+        self.frame_count += 1
+
+        if frame is None:
+            return []
+
+        if not isinstance(frame, np.ndarray):
+            return []
+
+        if frame.size == 0:
+            return []
+
+        # ----------------------------------------------------
+        # YOLO
+        # ----------------------------------------------------
+
+        if self.model_loaded and self.net is not None:
+
+            raw_detections = self._run_yolo(frame)
+
+            obstacles = self._convert_detections(
+                raw_detections,
+                frame,
+            )
+
+        # ----------------------------------------------------
+        # Heuristic fallback
+        # ----------------------------------------------------
+
+        elif self.using_heuristic:
+
+            obstacles = self._detect_heuristic(frame)
+
+        else:
+
+            obstacles = []
+
+        # Store history.
+        self.history.append(obstacles)
+
+        self.last_detection_time = time.time()
+
+        return obstacles
+
+    # ========================================================
+    # VISUALIZATION
+    # ========================================================
+
+    def draw_detections(
+        self,
+        frame: np.ndarray,
+        obstacles: List[ObstacleResult],
+    ) -> np.ndarray:
+        """
+        Draw detection boxes and navigation status.
+
+        This is optional and can be called by camera_sim.py.
+        """
+
+        if frame is None:
+            return frame
+
+        output = frame.copy()
+
+        frame_h, frame_w = output.shape[:2]
+
+        # Driving corridor.
+        left_x = int(frame_w * CORRIDOR_LEFT)
+        right_x = int(frame_w * CORRIDOR_RIGHT)
+
+        cv2.line(
+            output,
+            (left_x, 0),
+            (left_x, frame_h),
+            (180, 180, 180),
+            1,
+        )
+
+        cv2.line(
+            output,
+            (right_x, 0),
+            (right_x, frame_h),
+            (180, 180, 180),
+            1,
+        )
+
+        for obstacle in obstacles:
+
+            x, y, w, h = obstacle.bbox
+
+            # Determine display color.
+            if obstacle.action == ObstacleAction.STOP:
+                color = (0, 0, 255)
+                action_text = "STOP"
+
+            elif obstacle.action == ObstacleAction.SLOW:
+                color = (0, 165, 255)
+                action_text = "SLOW"
+
+            else:
+                color = (0, 255, 0)
+                action_text = "OK"
+
+            label = getattr(
+                obstacle,
+                "label",
+                str(obstacle.cls),
+            )
+
+            text = (
+                f"{label} "
+                f"{obstacle.confidence:.2f} "
+                f"{action_text}"
+            )
+
+            cv2.rectangle(
+                output,
+                (x, y),
+                (x + w, y + h),
+                color,
+                2,
+            )
+
+            text_y = max(
+                20,
+                y - 8,
+            )
+
+            cv2.putText(
+                output,
+                text,
+                (x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        # Status.
+        if self.model_loaded:
+            mode_text = "YOLO"
+        elif self.using_heuristic:
+            mode_text = "MOTION"
+        else:
+            mode_text = "NONE"
+
+        cv2.putText(
+            output,
+            f"AI: {mode_text}",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        return output
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    def reset_tracking(self) -> None:
+        """
+        Reset temporal detection history.
+        """
+
+        self.history.clear()
+        self.confirmation_counter.clear()
+        self.previous_objects.clear()
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
+
+    def close(self) -> None:
+        """
+        Release detector resources.
+        """
+
+        self.net = None
+        self.bg_subtractor = None
+
+        self.history.clear()
+        self.confirmation_counter.clear()
+        self.previous_objects.clear()
 
 
-# -- Standalone test ----------------------------------------
-if __name__ == "__main__":
+# ============================================================
+# SIMPLE TEST
+# ============================================================
+
+def main():
+    """
+    Standalone camera test.
+
+    Run:
+
+        python3 ai_obstacle_detector.py
+
+    Press Q to exit.
+    """
+
+    print("=" * 60)
+    print("MediVan AI Obstacle Detector Test")
+    print("=" * 60)
+
     detector = AIObstacleDetector()
-    print(f"Detection mode: {detector.mode}")
 
-    # Generate a test frame with a synthetic obstacle
-    frame = np.full((FRAME_H, FRAME_W, 3), (180, 175, 165), dtype=np.uint8)
-    cv2.rectangle(frame, (250, 200), (320, 380), (80, 120, 160), -1)
+    cap = cv2.VideoCapture(0)
 
-    # Run detection multiple times to train MOG2
-    for i in range(150):
-        if i == 130:
-            cv2.rectangle(frame, (250, 200), (320, 380), (80, 120, 160), -1)
-        results = detector.detect(frame)
-        if results:
-            for r in results:
-                print(f"  Frame {i}: {r.classification.value} "
-                      f"conf={r.confidence:.2f} area={r.area} "
-                      f"action={r.action.value}")
+    if not cap.isOpened():
+
+        print("[AI TEST] Cannot open camera.")
+
+        detector.close()
+        return
+
+    print("[AI TEST] Camera started.")
+    print("[AI TEST] Press Q to quit.")
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            print("[AI TEST] Failed to read frame.")
             break
 
-    print(f"Final mode: {detector.mode}")
-    print("Test complete.")
+        obstacles = detector.detect(frame)
+
+        for obstacle in obstacles:
+
+            label = getattr(
+                obstacle,
+                "label",
+                str(obstacle.cls),
+            )
+
+            print(
+                f"[AI] "
+                f"{label} | "
+                f"confidence={obstacle.confidence:.2f} | "
+                f"proximity={obstacle.proximity:.2f} | "
+                f"action={obstacle.action}"
+            )
+
+        display = detector.draw_detections(
+            frame,
+            obstacles,
+        )
+
+        cv2.imshow(
+            "MediVan AI Obstacle Detector",
+            display,
+        )
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    detector.close()
+
+    print("[AI TEST] Detector stopped.")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
